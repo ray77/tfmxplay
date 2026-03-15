@@ -254,7 +254,7 @@ void initParams() {
   params.push_back(Param("h","help",false,parHelp,"","display this help"));
   params.push_back(Param("v","version",false,parVersion,"","show version"));
 
-  params.push_back(Param("s","song",true,parSong,"num","select song"));
+  params.push_back(Param("s","subsong",true,parSong,"(num)","select song"));
   params.push_back(Param("n","ntsc",false,parNTSC,"","use NTSC rate"));
   params.push_back(Param("l","hle",false,parHLE,"","use high-level emulation (lower quality but much faster)"));
   params.push_back(Param("d","dump",false,parDump,"","dump 16-bit stereo raw output to tfmx.raw"));
