@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.5)
-project(tfmxplay)
+project(tfmxplay VERSION 0.0.1)
 
 # are you kidding me?! macOS 10.15 and still no C++11 by default?!
 set(CMAKE_CXX_STANDARD 11)
@@ -26,6 +26,7 @@ else()
 endif()
 
 add_executable(tfmxplay src/blip_buf.c src/sinc.cpp src/tfmx.cpp src/tfmxplay.cpp src/time.cpp)
+target_compile_definitions(tfmxplay PRIVATE TFMXPLAY_VERSION="${PROJECT_VERSION}")
 
 if (HAVE_DRM)
   target_compile_definitions(tfmxplay PUBLIC _SYNC_VBLANK)

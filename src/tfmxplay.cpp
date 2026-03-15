@@ -24,6 +24,10 @@
 
 #include "ta-time.h"
 
+#ifndef TFMXPLAY_VERSION
+#define TFMXPLAY_VERSION "0.0.1"
+#endif
+
 #include "blip_buf.h"
 #include "tfmx.h"
 
@@ -58,7 +62,7 @@ SDL_AudioDeviceID ai;
 SDL_AudioSpec ac;
 SDL_AudioSpec ar;
 
-bool quit, ntsc, hle, dumpFile;
+bool quit, ntsc, hle, dumpFile, showVersionOnly;
 FILE* dump;
 
 int sr, speed;
@@ -178,7 +182,12 @@ static void process(void*, Uint8* stream, int len) {
   }
 }
 
+void printVersion() {
+  printf("\n\x1b[33mtfmxplay %s (c) 2026 by ray77\x1b[m\n\n", TFMXPLAY_VERSION);
+}
+
 bool parHelp(string) {
+  printVersion();
   printf("usage: tfmxplay [-params] mdat.file [smpl.file]\n");
   for (auto& i: params) {
     if (i.value) {
@@ -236,8 +245,14 @@ bool parSpeed(string v) {
   return true;
 }
 
+bool parVersion(string) {
+  showVersionOnly=true;
+  return true;
+}
+
 void initParams() {
   params.push_back(Param("h","help",false,parHelp,"","display this help"));
+  params.push_back(Param("v","version",false,parVersion,"","show version"));
 
   params.push_back(Param("s","song",true,parSong,"num","select song"));
   params.push_back(Param("n","ntsc",false,parNTSC,"","use NTSC rate"));
@@ -255,6 +270,7 @@ int main(int argc, char** argv) {
   defCIAVal=0;
   ntsc=false;
   dumpFile=false;
+  showVersionOnly=false;
   songid=0;
 #ifdef _SYNC_VBLANK
   syncVBlank=false;
@@ -307,7 +323,13 @@ int main(int argc, char** argv) {
     }
   }
 
+  if (showVersionOnly) {
+    printVersion();
+    return 0;
+  }
+
   if (mdat=="") {
+    printVersion();
     printf("usage: %s [-params] mdat.file [smpl.file]\n",argv[0]);
     return 1;
   }
@@ -350,6 +372,7 @@ int main(int argc, char** argv) {
     }
   }
 
+  printVersion();
   printf("opening audio\n");
   
   SDL_Init(SDL_INIT_AUDIO);
