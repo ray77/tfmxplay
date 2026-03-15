@@ -1,9 +1,33 @@
 # tfmxplay
+![TFMXPlay Logo](img/logo.png)
 
-not to be confused with [another player with the same name](http://www.boomerangsworld.de/cms/patches/tfmxplay.html).
+the player / converter strives to meet Turrican 2 standards.
 
-this is my own clean-room design TFMX player.
+## Runtime keys
 
-the difference between this player and the other ones is that no reverse engineering, obfuscated code, assembly source or emulation is involved; instead relying upon existing documentation, guesswork and ABX tests for most of it. hence "clean-room design".
+Keys are read from the terminal while the player is running.
 
-the player strives to meet Turrican 2 standards.
+| Key | Action |
+|-----|--------|
+| **Tab** | Next subsong |
+| **Shift+Tab** | Previous subsong |
+| **Enter** / **Return** | Toggle frame trace |
+| **\\** (backslash) | Set tempo to 6× (70937×6), show CIA value |
+| **~** (tilde) | Toggle register trace |
+| **Backspace** / **Delete** | Reset tempo to default (PAL 70937 / NTSC 59659) |
+| **[** | Increase tempo (~9%) |
+| **]** | Decrease tempo (~9%) |
+| **{** | Double tempo |
+| **}** | Halve tempo |
+| **`** (backtick) | Toggle NTSC/PAL |
+| **1** | Show channel 0 mute status |
+| **2** | Show channel 1 mute status |
+| **3** | Show channel 2 mute status |
+| **4** | Show channel 3 mute status |
+| **5** | Toggle channel 0 macro trace |
+| **6** | Toggle channel 1 macro trace |
+| **7** | Toggle channel 2 macro trace |
+| **8** | Toggle channel 3 macro trace |
+| **A–Z** | Lock channel 3, play macro 0–25 (volume 20, 15) |
+| **Ctrl+C** | Quit |
+
