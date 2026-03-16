@@ -34,4 +34,7 @@ Keys are read from the terminal while the player is running.
 | **Ctrl+C** | Quit |
 
 
+EXAMPLE:
+./tfmxplay -convert2xm=T2w1.xm mdat.T2_World
+
 ![hippo](img/v001.gif)
