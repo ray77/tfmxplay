@@ -25,7 +25,7 @@
 #include "ta-time.h"
 
 #ifndef TFMXPLAY_VERSION
-#define TFMXPLAY_VERSION "0.0.1"
+#define TFMXPLAY_VERSION "0.0.2"
 #endif
 
 #include "blip_buf.h"
@@ -201,7 +201,6 @@ bool parHelp(string) {
   printf("Runtime keys:\n");
   printf("  Tab: next subsong\n");
   printf("  Shift+Tab: previous subsong\n");
-  printf("  -convert2xm (file.xm): convert TFMX to XM and exit\n");
   return false;
 }
 

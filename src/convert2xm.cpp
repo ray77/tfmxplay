@@ -41,7 +41,7 @@
 #include "tfmx.h"
 
 #ifndef TFMXPLAY_VERSION
-#define TFMXPLAY_VERSION "0.0.1"
+#define TFMXPLAY_VERSION "0.0.2"
 #endif
 
 /* Win32 lacks arpa/inet.h — provide byte-swap helpers for big-endian TFMX data */
