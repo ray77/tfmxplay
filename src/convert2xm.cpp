@@ -389,11 +389,7 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
   fwrite("Extended Module: ", 1, 17, out);
   char xmName[21];
   memset(xmName, 0, sizeof(xmName));
-  for (int i = 0; i < 20 && head.desc[i] != '\0'; i++) {
-    unsigned char c = (unsigned char)head.desc[i];
-    xmName[i] = (c >= 32 && c < 127) ? c : ' ';
-  }
-  xmName[20] = '\0';
+  snprintf(xmName, 21, "domy@noisebay.org");
   fwrite(xmName, 1, 20, out);
   fputc(0x1A, out);
   memset(xmName, 0, 20);
