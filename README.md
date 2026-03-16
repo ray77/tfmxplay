@@ -31,3 +31,5 @@ Keys are read from the terminal while the player is running.
 | **A–Z** | Lock channel 3, play macro 0–25 (volume 20, 15) |
 | **Ctrl+C** | Quit |
 
+
+![hippo](img/v001.gif)
