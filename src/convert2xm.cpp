@@ -848,12 +848,23 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
               break;
             }
             case pKeyUp: {
-              /* Release the note on the target channel.
-               * Mapped to XM note-off (97), which triggers the release phase
-               * of the macro envelope in post-processing. */
+              /* Release → 97 → Phase 2.  NEVER schedule 97 beyond row+1: a KeyUp
+               * many rows ahead would fire after the *next* note on that channel
+               * and corrupt envelopes (wrong subsong / „passt nicht“). */
               int ch = item.chan;
-              if (ch >= 0 && ch < BASE_CHANS && totalXmRows < MAX_TOTAL_ROWS)
-                bigGrid[totalXmRows * numChans + ch].note = 97;
+              if (ch < 0 || ch >= BASE_CHANS || totalXmRows >= MAX_TOTAL_ROWS)
+                break;
+              XMCell* here = &bigGrid[totalXmRows * numChans + ch];
+              if (here->note >= 1 && here->note < 97) {
+                int nr = totalXmRows + 1;
+                if (nr < MAX_TOTAL_ROWS) {
+                  XMCell* nxt = &bigGrid[nr * numChans + ch];
+                  if (nxt->note == 0 || nxt->note == 97)
+                    nxt->note = 97;
+                }
+              } else {
+                here->note = 97;
+              }
               break;
             }
             case pPPat: {
@@ -976,8 +987,10 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
       if (totalXmRows < MAX_TOTAL_ROWS && !rowDone) {
         for (int c = 0; c < BASE_CHANS; c++) {
           if (!chanEnv[c].active) continue;
-          /* ~¾ pattern-tick rate: full xmSpeed made pEnve hits reach target too fast */
-          int envFrames = (xmSpeed * 2 + 2) / 3; /* ~⅔ tick — etwas langsamer als ¾ */
+          int envFrames = (xmSpeed * 2 + 2) / 3;
+          /* Akkord-Pads (pEnve → 0): schneller ausfaden pro Tick */
+          if (chanEnv[c].target == 0 && chanEnv[c].vol > 0)
+            envFrames = xmSpeed;
           if (envFrames < 1) envFrames = 1;
           if (envFrames > xmSpeed) envFrames = xmSpeed;
           for (int fr = 0; fr < envFrames && chanEnv[c].active; fr++) {
@@ -1024,7 +1037,8 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
             int slideTicks = (xmSpeed > 1) ? (xmSpeed - 1) : 1;
             if (delta > 0) {
               int speed = (delta + slideTicks - 1) / slideTicks;
-              const int minRows = 7;
+              /* minRows war 7 → Pads wirkten ewig; 3 = kürzeres Akkord-Ende */
+              const int minRows = 3;
               if (delta > slideTicks * 2 && speed > 1) {
                 int cap = (delta + minRows * slideTicks - 1) / (minRows * slideTicks);
                 if (cap >= 1 && cap < speed) speed = cap;
@@ -1159,7 +1173,6 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
            * same despite the boosted initial volume. */
           envSlide = ef.sustainSlide;
           if (envSlide != 0 && effVol > 0) {
-            /* Slower slides (~½): fades were ending audibly too soon vs TFMX. */
             int s = (abs(envSlide) * scaledEV * 2 + effVol * 5 - 1) / (effVol * 5);
             if (s < 1) s = 1;
             if (s > 15) s = 15;
@@ -1182,13 +1195,36 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
          * Instead, we apply a gradual volume slide (release envelope). */
         cell->note = 0;
         if (releaseSlide != 0) {
-          envSlide = releaseSlide;
+          int rs = releaseSlide;
+          int cap = 15;
+          if (rs < -cap) rs = -cap;
+          else if (rs > cap) rs = cap;
+          /* Schnelleres Auskl. als TFMX-Macro (ca. ×1,4 zum Mapping) */
+          if (rs < 0) {
+            int m = (-rs * 7 + 4) / 5;
+            if (m < 1) m = 1;
+            if (m > 15) m = 15;
+            rs = -m;
+          }
+          envSlide = rs;
           envDelayLeft = 0;
           inRelease = true;
         } else if (envSlide < 0) {
+          if (envSlide < -1) {
+            int m = (-envSlide * 7 + 4) / 5;
+            if (m < 1) m = 1;
+            if (m > 15) m = 15;
+            envSlide = -m;
+          }
           inRelease = true;
         } else {
-          envSlide = -2; /* fallback: gentle fade if no release defined */
+          envSlide = -6;
+          if (runningVol > 0) {
+            int s = (runningVol + 1) / 2;
+            if (s < 3) s = 3;
+            if (s > 15) s = 15;
+            envSlide = -s;
+          }
           inRelease = true;
         }
         vibActive = false;
