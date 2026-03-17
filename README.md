@@ -1,4 +1,4 @@
-# tfmxplay
+# tfmxplay XM
 ![TFMXPlay Logo](img/logo.png)
 
 the player / converter strives to meet Turrican 2 standards.
