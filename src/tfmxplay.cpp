@@ -114,6 +114,26 @@ static void handleTerm(int) {
   exit(0);
 }
 
+#ifdef _WIN32
+static BOOL WINAPI handleConsoleCtrl(DWORD ctrlType) {
+  if (ctrlType==CTRL_C_EVENT || ctrlType==CTRL_BREAK_EVENT) {
+    quit=true;
+    printf("quit!\n");
+    SDL_CloseAudioDevice(ai);
+    finish();
+    if (dumpFile) {
+      printf("closing dump\n");
+      fflush(dump);
+      fclose(dump);
+      dumpFile=false;
+    }
+    exit(0);
+    return TRUE;
+  }
+  return FALSE;
+}
+#endif
+
 static void processHLE(void*, Uint8* stream, int len) {
   short* buf[2];
   short temp[2];
@@ -437,7 +457,10 @@ int main(int argc, char** argv) {
   printVersion();
   printf("opening audio\n");
   
-  SDL_Init(SDL_INIT_AUDIO);
+  if (SDL_Init(SDL_INIT_AUDIO)<0) {
+    printf("SDL_Init failed: %s\n",SDL_GetError());
+    return 1;
+  }
 
   ac.freq=44100;
   ac.format=AUDIO_S16;
@@ -449,7 +472,12 @@ int main(int argc, char** argv) {
     ac.callback=process;
   }
   ac.userdata=NULL;
-  ai=SDL_OpenAudioDevice(SDL_GetAudioDeviceName(0,0),0,&ac,&ar,SDL_AUDIO_ALLOW_CHANNELS_CHANGE|SDL_AUDIO_ALLOW_FREQUENCY_CHANGE);
+  ai=SDL_OpenAudioDevice(NULL,0,&ac,&ar,SDL_AUDIO_ALLOW_CHANNELS_CHANGE|SDL_AUDIO_ALLOW_FREQUENCY_CHANGE);
+  if (ai==0) {
+    printf("SDL_OpenAudioDevice failed: %s\n",SDL_GetError());
+    SDL_Quit();
+    return 1;
+  }
   sr=ar.freq;
   if (ntsc) {
     targetSR=3579545;
@@ -475,12 +503,14 @@ int main(int argc, char** argv) {
   p.play(songid);
   SDL_PauseAudioDevice(ai,0);
   
-#ifndef _WIN32
+#ifdef _WIN32
+  SetConsoleCtrlHandler(handleConsoleCtrl,TRUE);
+#else
   sigemptyset(&intsa.sa_mask);
   intsa.sa_flags=0;
   intsa.sa_handler=handleTerm;
   sigaction(SIGINT,&intsa,NULL);
-#endif  
+#endif
 
   setvbuf(stdin,NULL,_IONBF,1);
 
@@ -493,6 +523,7 @@ int main(int argc, char** argv) {
   GetConsoleMode(winin,(LPDWORD)&termpropi);
   termprop|=ENABLE_VIRTUAL_TERMINAL_PROCESSING;
   termpropi&=~ENABLE_LINE_INPUT;
+  termpropi&=~ENABLE_PROCESSED_INPUT;
   SetConsoleMode(winout,termprop);
   SetConsoleMode(winin,termpropi);
 #else
@@ -532,6 +563,9 @@ int main(int argc, char** argv) {
     c=fgetc(stdin);
     if (c==EOF) break;
     switch (c) {
+      case 3:
+        handleTerm(0);
+        break;
       case '\t':
         songid=(songid+1)%32;
         p.play(songid);
