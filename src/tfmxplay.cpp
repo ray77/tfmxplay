@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <string.h>
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -63,9 +64,46 @@ SDL_AudioDeviceID ai;
 SDL_AudioSpec ac;
 SDL_AudioSpec ar;
 
-bool quit, ntsc, hle, dumpFile, showVersionOnly, doConvert2XM;
+bool quit, ntsc, hle, dumpFile, showVersionOnly, showInfo, doConvert2XM;
 std::string convert2xmPath;
 FILE* dump;
+long dumpDataSize;
+
+static void wavWriteLE32(FILE* f, unsigned int v) {
+  unsigned char b[4]={(unsigned char)(v&0xff),(unsigned char)((v>>8)&0xff),(unsigned char)((v>>16)&0xff),(unsigned char)((v>>24)&0xff)};
+  fwrite(b,1,4,f);
+}
+
+static void wavWriteLE16(FILE* f, unsigned short v) {
+  unsigned char b[2]={(unsigned char)(v&0xff),(unsigned char)((v>>8)&0xff)};
+  fwrite(b,1,2,f);
+}
+
+static void wavWriteHeader(FILE* f, int sampleRate, int channels, int bitsPerSample) {
+  int byteRate=sampleRate*channels*(bitsPerSample/8);
+  int blockAlign=channels*(bitsPerSample/8);
+  fwrite("RIFF",1,4,f);
+  wavWriteLE32(f,0); // placeholder for file size - 8
+  fwrite("WAVE",1,4,f);
+  fwrite("fmt ",1,4,f);
+  wavWriteLE32(f,16); // PCM fmt chunk size
+  wavWriteLE16(f,1);  // PCM format
+  wavWriteLE16(f,(unsigned short)channels);
+  wavWriteLE32(f,(unsigned int)sampleRate);
+  wavWriteLE32(f,(unsigned int)byteRate);
+  wavWriteLE16(f,(unsigned short)blockAlign);
+  wavWriteLE16(f,(unsigned short)bitsPerSample);
+  fwrite("data",1,4,f);
+  wavWriteLE32(f,0); // placeholder for data size
+}
+
+static void wavFinalizeHeader(FILE* f, long dataSize) {
+  fseek(f,4,SEEK_SET);
+  wavWriteLE32(f,(unsigned int)(dataSize+36));
+  fseek(f,40,SEEK_SET);
+  wavWriteLE32(f,(unsigned int)dataSize);
+  fseek(f,0,SEEK_END);
+}
 
 int sr, speed;
 double targetSR;
@@ -108,6 +146,7 @@ static void handleTerm(int) {
   if (dumpFile) {
     printf("closing dump\n");
     fflush(dump);
+    wavFinalizeHeader(dump,dumpDataSize);
     fclose(dump);
     dumpFile=false;
   }
@@ -124,6 +163,7 @@ static BOOL WINAPI handleConsoleCtrl(DWORD ctrlType) {
     if (dumpFile) {
       printf("closing dump\n");
       fflush(dump);
+      wavFinalizeHeader(dump,dumpDataSize);
       fclose(dump);
       dumpFile=false;
     }
@@ -152,9 +192,12 @@ static void processHLE(void*, Uint8* stream, int len) {
     //buf[1][i*ar.channels]=temp[1];
   }
   if (dumpFile) {
-    if (fwrite(stream,1,len,dump)<0) {
+    size_t written=fwrite(stream,1,len,dump);
+    if (written>0) dumpDataSize+=written;
+    if ((int)written<len) {
       perror("cannot write");
       printf("stopping dump!\n");
+      wavFinalizeHeader(dump,dumpDataSize);
       fclose(dump);
       dumpFile=false;
     }
@@ -195,9 +238,12 @@ static void process(void*, Uint8* stream, int len) {
   }
 
   if (dumpFile) {
-    if (fwrite(stream,1,len,dump)<0) {
+    size_t written=fwrite(stream,1,len,dump);
+    if (written>0) dumpDataSize+=written;
+    if ((int)written<len) {
       perror("cannot write");
       printf("stopping dump!\n");
+      wavFinalizeHeader(dump,dumpDataSize);
       fclose(dump);
       dumpFile=false;
     }
@@ -308,6 +354,109 @@ bool parVersion(string) {
   return true;
 }
 
+bool parInfo(string) {
+  showInfo=true;
+  return true;
+}
+
+static unsigned short be16(const void* p) {
+  const unsigned char* b=(const unsigned char*)p;
+  return (unsigned short)((b[0]<<8)|b[1]);
+}
+static unsigned int be32(const void* p) {
+  const unsigned char* b=(const unsigned char*)p;
+  return ((unsigned int)b[0]<<24)|((unsigned int)b[1]<<16)|((unsigned int)b[2]<<8)|b[3];
+}
+
+void printInfo(const char* mdatPath) {
+  FILE* f=fopen(mdatPath,"rb");
+  if (!f) {
+    printf("cannot open %s\n",mdatPath);
+    return;
+  }
+  fseek(f,0,SEEK_END);
+  long fileSize=ftell(f);
+  fseek(f,0,SEEK_SET);
+
+  unsigned char raw[512];
+  if (fread(raw,1,512,f)!=512) {
+    printf("file too small for TFMX header\n");
+    fclose(f);
+    return;
+  }
+  fclose(f);
+
+  char ident[11];
+  memcpy(ident,raw,10);
+  ident[10]=0;
+
+  const char* formatName="unknown";
+  if (memcmp(raw,"TFMX-SONG",9)==0) {
+    formatName="TFMX (standard)";
+  } else if (memcmp(raw,"TFMX_SONG",9)==0) {
+    formatName="TFMX 7.0";
+  }
+
+  printf("\x1b[1;36mFile:\x1b[0m    %s\n",mdatPath);
+  printf("\x1b[1;36mSize:\x1b[0m    %ld bytes\n",fileSize);
+  printf("\x1b[1;36mFormat:\x1b[0m  %s (ident: \"%s\")\n",formatName,ident);
+
+  unsigned int ordSeek=be32(&raw[0x1D0]);
+  unsigned int patSeek=be32(&raw[0x1D4]);
+  unsigned int macroSeek=be32(&raw[0x1D8]);
+  bool packed=(ordSeek!=0);
+  if (ordSeek==0) ordSeek=0x800;
+  if (patSeek==0) patSeek=0x400;
+  if (macroSeek==0) macroSeek=0x600;
+  printf("\x1b[1;36mLayout:\x1b[0m  %s (ords=0x%X pats=0x%X macros=0x%X)\n",
+    packed?"packed":"unpacked",ordSeek,patSeek,macroSeek);
+
+  char desc[241];
+  memcpy(desc,&raw[16],240);
+  desc[240]=0;
+  for (int i=239; i>=0 && (desc[i]==' '||desc[i]==0); i--) desc[i]=0;
+
+  printf("\n\x1b[1;33mText:\x1b[0m\n");
+  if (desc[0]) {
+    int pos=0;
+    while (pos<240 && desc[pos]) {
+      int lineEnd=pos;
+      while (lineEnd<pos+40 && lineEnd<240 && desc[lineEnd]) lineEnd++;
+      char line[41];
+      int len=lineEnd-pos;
+      memcpy(line,&desc[pos],len);
+      line[len]=0;
+      for (int i=len-1; i>=0 && line[i]==' '; i--) line[i]=0;
+      if (line[0]) printf("  %s\n",line);
+      pos+=40;
+    }
+  } else {
+    printf("  (empty)\n");
+  }
+
+  printf("\n\x1b[1;33mSubsongs:\x1b[0m\n");
+  int count=0;
+  for (int i=0; i<32; i++) {
+    unsigned short start=be16(&raw[0x100+i*2]);
+    unsigned short end=be16(&raw[0x140+i*2]);
+    unsigned short spd=be16(&raw[0x180+i*2]);
+    if (end<start) continue;
+    if (start==0 && end==0 && i>0) continue;
+    if (start>=128 || end>=128) continue;
+    int rows=end-start+1;
+    int speed=spd+1;
+    const char* tempoType="ticks/row";
+    if (spd>15) tempoType="BPM";
+    printf("  \x1b[1m%2d:\x1b[0m rows %3d-%3d (%3d rows), speed %d %s\n",
+      i,(int)start,(int)end,rows,speed,tempoType);
+    count++;
+  }
+  if (count==0) printf("  (none found)\n");
+  else printf("\n  %d subsong(s) found.\n",count);
+
+  printf("\n");
+}
+
 bool parConvert2XM(string v) {
   doConvert2XM=true;
   convert2xmPath=v;
@@ -317,13 +466,14 @@ bool parConvert2XM(string v) {
 void initParams() {
   params.push_back(Param("h","help",false,parHelp,"","display this help"));
   params.push_back(Param("v","version",false,parVersion,"","show version"));
+  params.push_back(Param("i","info",false,parInfo,"","show TFMX module info (header, subsongs, format)"));
 
   params.push_back(Param("s","subsong",true,parSong,"(num)","select song"));
   params.push_back(Param("n","ntsc",false,parNTSC,"","use NTSC rate"));
   params.push_back(Param("l","hle",false,parHLE,"","use high-level emulation (lower quality but much faster)"));
-  params.push_back(Param("d","dump",false,parDump,"","dump 16-bit stereo raw output to tfmx.raw"));
+  params.push_back(Param("d","dump",false,parDump,"","dump 16-bit stereo output to tfmx.wav"));
   params.push_back(Param("S","speed",true,parSpeed,"","set speed in clock/2 cycles"));
-  params.push_back(Param("c","convert2xm",false,parConvert2XM,"[=file.xm]","convert TFMX to XM and write file (default: mdat name with .xm)"));
+  params.push_back(Param("c","convert2xm",false,parConvert2XM,"[=file.xm]","convert TFMX to XM file (default: tfmx_<name>.xm)"));
 
 #ifdef _SYNC_VBLANK
   params.push_back(Param("V","vblank",false,parVBlank,"","sync to VBlank"));
@@ -336,7 +486,9 @@ int main(int argc, char** argv) {
   defCIAVal=0;
   ntsc=false;
   dumpFile=false;
+  dumpDataSize=0;
   showVersionOnly=false;
+  showInfo=false;
   doConvert2XM=false;
   convert2xmPath="";
   songid=0;
@@ -396,10 +548,20 @@ int main(int argc, char** argv) {
     return 0;
   }
 
-  if (mdat=="") {
+  if (mdat=="" && !showInfo) {
     printVersion();
     printf("usage: %s [-params] mdat.file [smpl.file]\n",argv[0]);
     return 1;
+  }
+
+  if (showInfo) {
+    if (mdat=="") {
+      printf("please provide a mdat file to inspect.\n");
+      return 1;
+    }
+    printVersion();
+    printInfo(mdat.c_str());
+    return 0;
   }
 
   if (smpl=="") {
@@ -415,10 +577,14 @@ int main(int argc, char** argv) {
   if (doConvert2XM) {
     string outPath=convert2xmPath;
     if (outPath.empty()) {
-      outPath=mdat;
-      size_t dot=outPath.rfind('.');
-      if (dot!=string::npos) outPath=outPath.substr(0,dot);
-      outPath+=".xm";
+      string base=mdat;
+      size_t slash=base.find_last_of("/\\");
+      if (slash!=string::npos) base=base.substr(slash+1);
+      if (base.substr(0,5)=="mdat.") base=base.substr(5);
+      else if (base.substr(0,4)=="mdat") base=base.substr(4);
+      if (!base.empty() && base[0]=='_') base=base.substr(1);
+      if (base.empty()) base="output";
+      outPath="tfmx_"+base+".xm";
     }
     if (!convertToXM(mdat.c_str(),smpl.c_str(),outPath.c_str(),songid)) {
       return 1;
@@ -446,14 +612,6 @@ int main(int argc, char** argv) {
   }
 #endif
 
-  if (dumpFile) {
-    dump=fopen("tfmx.raw","wb");
-    if (dump==NULL) {
-      perror("cannot dump");
-      return 1;
-    }
-  }
-
   printVersion();
   printf("opening audio\n");
   
@@ -479,6 +637,16 @@ int main(int argc, char** argv) {
     return 1;
   }
   sr=ar.freq;
+
+  if (dumpFile) {
+    dump=fopen("tfmx.wav","wb");
+    if (dump==NULL) {
+      perror("cannot dump");
+      return 1;
+    }
+    dumpDataSize=0;
+    wavWriteHeader(dump,ar.freq,ar.channels,16);
+  }
   if (ntsc) {
     targetSR=3579545;
     speed=59659;
@@ -677,6 +845,7 @@ int main(int argc, char** argv) {
   if (dumpFile) {
     printf("closing dump\n");
     fflush(dump);
+    wavFinalizeHeader(dump,dumpDataSize);
     fclose(dump);
     dumpFile=false;
   }

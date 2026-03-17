@@ -532,7 +532,7 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
   fwrite("Extended Module: ", 1, 17, out);
   char xmName[21];
   memset(xmName, 0, sizeof(xmName));
-  snprintf(xmName, 21, "domy@noisebay.org");
+  snprintf(xmName, 21, "TFMX Subsong %02d", subsong);
   fwrite(xmName, 1, 20, out);
   fputc(0x1A, out);
   memset(xmName, 0, 20);
@@ -601,6 +601,10 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
   for (int c = 0; c < 8; c++) chanEnv[c].active = false;
 
   int totalXmRows = 0;
+  int ordRowToXmRow[128];
+  memset(ordRowToXmRow, -1, sizeof(ordRowToXmRow));
+  int loopJumpXmRow = -1;
+  int loopJumpTargetXmRow = -1;
 
   /* Set initial Amiga stereo panning (XM effect 8xx).
    * Classic Amiga panning pattern: L,R,R,L,L,R,R,L  (channels 0-7).
@@ -689,7 +693,11 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
       if (cmd == 0) break;
       if (cmd == 1) {
         int jumpTarget = track[ordRow][2].trans;
-        if (jumpTarget <= ordRow) break; /* prevent infinite loops */
+        if (jumpTarget <= ordRow) {
+          loopJumpXmRow = totalXmRows > 0 ? totalXmRows - 1 : 0;
+          loopJumpTargetXmRow = ordRowToXmRow[jumpTarget];
+          break;
+        }
         ordRow = jumpTarget - 1;
       }
       if (cmd == 2) {
@@ -698,6 +706,7 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
       continue;
     }
 
+    ordRowToXmRow[ordRow] = totalXmRows;
     initOrderRow(ordRow);
 
     /* Tick loop for this order row. Each iteration = one XM row.
@@ -939,6 +948,26 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
     }
   }
   if (totalXmRows < 1) totalXmRows = 1;
+
+  if (loopJumpXmRow >= 0 && loopJumpTargetXmRow >= 0) {
+    int srcRow = loopJumpXmRow;
+    int dstPat = loopJumpTargetXmRow / ROWS_PER_PAT;
+    int dstRow = loopJumpTargetXmRow % ROWS_PER_PAT;
+    if (srcRow < MAX_TOTAL_ROWS) {
+      XMCell* cell = &bigGrid[srcRow * numChans + 0];
+      if (cell->fx == 0 && cell->param == 0) {
+        cell->fx = 0x0B;
+        cell->param = (unsigned char)dstPat;
+      }
+      if (dstRow > 0) {
+        XMCell* cell2 = &bigGrid[srcRow * numChans + 1];
+        if (cell2->fx == 0 && cell2->param == 0) {
+          cell2->fx = 0x0D;
+          cell2->param = (unsigned char)dstRow;
+        }
+      }
+    }
+  }
 
   /* ===================================================================
    * PHASE 2: Post-process the XM grid.
