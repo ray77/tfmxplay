@@ -42,7 +42,7 @@
 #include "tfmx.h"
 
 #ifndef TFMXPLAY_VERSION
-#define TFMXPLAY_VERSION "0.0.3"
+#define TFMXPLAY_VERSION "0.0.4"
 #endif
 
 /* Win32 lacks arpa/inet.h — provide byte-swap helpers for big-endian TFMX data */
@@ -109,6 +109,7 @@ struct MacroSampleInfo {
   int setNoteVal;  /* mSetNote value before mOn; -1 = no fixed attack pitch */
   int sweepAmt;    /* mAddBegin: bytes per frame to shift loop start (0=none) */
   int sweepFrames; /* frames of sweep before mOneShot/mStop */
+  int sweepHalfPeriod; /* data[0] from mAddBegin: frames per ping-pong half-cycle */
 };
 
 /*
@@ -155,7 +156,7 @@ struct MacroEffectInfo {
  * that the listener perceives as the instrument's timbre.
  */
 static MacroSampleInfo getMacroSample(const TFMXMacroData macro[256]) {
-  MacroSampleInfo info = { 0, 512, 0, 0, false, false, 0, -1, 0, -1, 0, 0 };
+  MacroSampleInfo info = { 0, 512, 0, 0, false, false, 0, -1, 0, -1, 0, 0, 0 };
   int curStart = 0;
   int curLenWords = 256;   /* TFMX lengths are in 16-bit words */
   bool gotAny = false;
@@ -226,6 +227,7 @@ static MacroSampleInfo getMacroSample(const TFMXMacroData macro[256]) {
             }
             if (frames <= 0) frames = 40;
             info.sweepFrames = frames;
+            info.sweepHalfPeriod = macro[i].data[0];
           }
           gotAddBegin = true;
         }
@@ -538,7 +540,7 @@ static unsigned int readBE32(const unsigned char* buf, int off) {
  *                  multiple songs, each with its own start/end order row and speed
  */
 bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath, int subsong) {
-  printf("XM-Export: multi-pattern, instrument 263 -> %s\n", outPath);
+  printf("XM-Export: converting -> %s\n", outPath);
   FILE* f;
   TFMXHeader head;
   int patPoint[128], macroPoint[128];
@@ -648,13 +650,13 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
   /* Load macro opcodes from the mdat buffer.
    * Each macro is terminated by mStop (opcode 7). We read up to 256 steps. */
   for (int i = 0; i < 128; i++) {
-    if (macroPoint[i] == 0) {
+    if (macroPoint[i] <= 0 || macroPoint[i] + 4 > (int)mdatSize) {
       macro[i][0].op = mStop;
       continue;
     }
     int off = macroPoint[i];
     int s = 0;
-    while (s < 256 && off + 4 <= (int)mdatSize) {
+    while (s < 256 && off >= 0 && off + 4 <= (int)mdatSize) {
       macro[i][s].op = mdatBuf[off];
       macro[i][s].data[0] = mdatBuf[off + 1];
       macro[i][s].data[1] = mdatBuf[off + 2];
@@ -664,6 +666,21 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
       off += 4;
     }
   }
+
+  int startRow = head.songStart[subsong];
+  int endRow = head.songEnd[subsong];
+  if (startRow < 0) startRow = 0;
+  if (endRow < startRow) endRow = startRow;
+
+  bool multimode = false;
+  for (int r = startRow; r <= endRow; r++) {
+    if (track[r][0].pat == 0xEF && track[r][0].trans == 0xFE) {
+      int cmd = (track[r][1].pat << 8) | track[r][1].trans;
+      if (cmd == 3) { multimode = true; break; }
+    }
+  }
+  if (multimode)
+    fprintf(stderr, "  TFMX 7V (multimode) detected\n");
 
   /* Open output XM */
   FILE* out = fopen(outPath, "wb");
@@ -678,7 +695,10 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
   fwrite("Extended Module: ", 1, 17, out);
   char xmName[21];
   memset(xmName, 0, sizeof(xmName));
-  snprintf(xmName, 21, "TFMX Subsong %02d", subsong);
+  if (multimode)
+    snprintf(xmName, 21, "TFMX[7v] Subsong %02d", subsong);
+  else
+    snprintf(xmName, 21, "TFMX Subsong %02d", subsong);
   fwrite(xmName, 1, 20, out);
   fputc(0x1A, out);
   memset(xmName, 0, 20);
@@ -748,10 +768,16 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
   bool chanAlive[8];
   bool stutterUsed[4] = {false, false, false, false};
   int lastEnveVol[8]; /* last scaled volume written by pEnve, for computing slides */
+  bool chanPortaActive[8];
+  int  chanPortaParam[8];
+  int  chanLastMacro[8];
   for (int c = 0; c < 8; c++) {
     chanEnv[c].active = false;
     chanAlive[c] = false;
     lastEnveVol[c] = 0;
+    chanPortaActive[c] = false;
+    chanPortaParam[c] = 0;
+    chanLastMacro[c] = -1;
   }
 
   int totalXmRows = 0;
@@ -764,6 +790,11 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
   int xmSpeed = head.songSpeed[subsong] + 1;
   if (xmSpeed < 1) xmSpeed = 6;
   if (xmSpeed > 31) xmSpeed = 31;
+
+  /* CIA-based BPM.  Default eClocks=14318 → 125 BPM (PAL 50 Hz).
+   * EFFE 0003 (timeshare) overrides this before simulation starts. */
+  int eClocks = 14318;
+  int xmBPM   = 125;
 
   /* Pre-compute macro effects for all 128 instruments.
    * Needed before simulation so pEnve can initialize chanEnv.vol to the
@@ -787,6 +818,23 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
   int atkInstMap[128];  /* atkInstMap[m] = XM instrument number (1-based) for attack; 0 = none */
   for (int i = 0; i < 128; i++) {
     macroSI[i] = getMacroSample(macro[i]);
+    /* Debug: dump macro info for instruments with mOn */
+    if (macroHasOn[i]) {
+      MacroEffectInfo& ef = macroFX[i];
+      MacroSampleInfo& si = macroSI[i];
+      fprintf(stderr, "M%03d: smpStart=%d len=%d oneShot=%d sweepAmt=%d sweepFrames=%d "
+              "addNote=%d sustainSlide=%d sustainTarget=%d releaseSlide=%d "
+              "addVol=%d setVol=%d | opcodes:",
+              i, si.start, si.len, si.oneShot, si.sweepAmt, si.sweepFrames,
+              si.addNote, ef.sustainSlide, ef.sustainTarget, ef.releaseSlide,
+              ef.addVol, ef.setVol);
+      for (int j = 0; j < 20; j++) {
+        if (macro[i][j].op == mStop) { fprintf(stderr, " %d:STOP", j); break; }
+        fprintf(stderr, " %d:%d(%02x%02x%02x)", j, macro[i][j].op,
+                macro[i][j].data[0], macro[i][j].data[1], macro[i][j].data[2]);
+      }
+      fprintf(stderr, "\n");
+    }
     atkInstMap[i] = 0;
     if (macroSI[i].setNoteVal < 0 || macroSI[i].atkLen < 32 || i + 64 >= 128)
       continue;
@@ -825,10 +873,10 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
   memset(instPlayLeft, 0, sizeof(instPlayLeft));
   memset(instPlayRight, 0, sizeof(instPlayRight));
 
-  int startRow = head.songStart[subsong];
-  int endRow = head.songEnd[subsong];
-  if (startRow < 0) startRow = 0;
-  if (endRow < startRow) endRow = startRow;
+  /* Track the first XM note played for each instrument so we can estimate
+   * the Amiga playback rate at sweep-bake time (Phase 4). */
+  int instFirstXmNote[128];
+  memset(instFirstXmNote, -1, sizeof(instFirstXmNote));
 
   /*
    * Initialize track states from an order table row.
@@ -874,10 +922,12 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
     /* Special order row commands: pat=0xEF, trans=0xFE on track 0 signals
      * a meta-command. cmd=0: stop song, cmd=1: jump to row, cmd=2: tempo. */
     if (track[ordRow][0].pat == 0xEF && track[ordRow][0].trans == 0xFE) {
-      int cmd = track[ordRow][1].trans;
+      int cmd = (track[ordRow][1].pat << 8) | track[ordRow][1].trans;
+      int w2  = (track[ordRow][2].pat << 8) | track[ordRow][2].trans;
+      int w3  = (track[ordRow][3].pat << 8) | track[ordRow][3].trans;
       if (cmd == 0) break;
       if (cmd == 1) {
-        int jumpTarget = track[ordRow][2].trans;
+        int jumpTarget = w2 & 0xFF;
         if (jumpTarget <= ordRow) {
           loopJumpXmRow = totalXmRows > 0 ? totalXmRows - 1 : 0;
           loopJumpTargetXmRow = ordRowToXmRow[jumpTarget];
@@ -886,8 +936,50 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
         ordRow = jumpTarget - 1;
       }
       if (cmd == 2) {
-        /* TODO: tempo changes not yet mapped to XM Fxx effect */
+        /* Speed change: w2 = new prescale (ticks-1 per row) */
+        int newSpeed = (w2 & 0xFF) + 1;
+        if (newSpeed >= 1 && newSpeed <= 31) {
+          if (totalXmRows > 0 && newSpeed != xmSpeed) {
+            XMCell* cell = &bigGrid[(totalXmRows - 1) * numChans];
+            for (int c = 0; c < numChans; c++) {
+              if (cell[c].fx == 0) { cell[c].fx = 0x0F; cell[c].param = (unsigned char)newSpeed; break; }
+            }
+          }
+          xmSpeed = newSpeed;
+        }
+        /* Optional CIA override in w3 */
+        if (!(w3 & 0xF200) && (w3 & 0x1FF) > 0xF) {
+          eClocks = 0x1B51F8 / (w3 & 0x1FF);
+          int newBPM = (int)(1790456.0 / eClocks + 0.5);
+          if (newBPM < 32) newBPM = 32; if (newBPM > 255) newBPM = 255;
+          if (totalXmRows > 0 && newBPM != xmBPM) {
+            XMCell* cell = &bigGrid[(totalXmRows - 1) * numChans];
+            for (int c = 0; c < numChans; c++) {
+              if (cell[c].fx == 0) { cell[c].fx = 0x0F; cell[c].param = (unsigned char)newBPM; break; }
+            }
+          }
+          xmBPM = newBPM;
+        }
       }
+      if (cmd == 3) {
+        /* Timeshare (7V mode): w3 low byte adjusts CIA timing */
+        if (!(w3 & 0x8000)) {
+          int x = (signed char)(w3 & 0xFF);
+          if (x < -0x20) x = -0x20;
+          eClocks = (14318 * (x + 100)) / 100;
+          int newBPM = (int)(1790456.0 / eClocks + 0.5);
+          if (newBPM < 32) newBPM = 32; if (newBPM > 255) newBPM = 255;
+          if (totalXmRows > 0 && newBPM != xmBPM) {
+            XMCell* cell = &bigGrid[(totalXmRows - 1) * numChans];
+            for (int c = 0; c < numChans; c++) {
+              if (cell[c].fx == 0) { cell[c].fx = 0x0F; cell[c].param = (unsigned char)newBPM; break; }
+            }
+          }
+          xmBPM = newBPM;
+          fprintf(stderr, "  timeshare: x=%d eClocks=%d BPM=%d\n", x, eClocks, newBPM);
+        }
+      }
+      /* cmd == 4 (fade) is handled implicitly by per-channel volume envelopes */
       continue;
     }
 
@@ -931,7 +1023,8 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
               ts[t].tim = 0x7fffffff; getMeOut = true;
               break;
             case pWait:
-              /* Pause this track for item.ins ticks before processing next command */
+              /* Pause this track for item.ins ticks (reference player DoTrack
+               * case 3: PWait=x.b.b1; return(0)). */
               ts[t].tim = item.ins; getMeOut = true;
               break;
             case pLoop: {
@@ -1034,7 +1127,48 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
             case pNOP: break;
             default:
               if (item.note >= 0xf0) break;
-              if ((item.note & 0xc0) == 0xc0) break; /* portamento — not yet mapped */
+              if ((item.note & 0xc0) == 0xc0) {
+                /* Portamento: slide from current pitch to the target note.
+                 * TFMX uses proportional portamento (period *= (256±rate)/256
+                 * every portaReset frames). We approximate with XM effect 3xx
+                 * (linear tone portamento).
+                 *
+                 * Direction fix: in TFMX, NotePort sets DestPeriod directly
+                 * from notevals[target] WITHOUT applying the macro's addNote,
+                 * but the current pitch already HAS addNote baked in.  XM's
+                 * tone portamento applies relativeNote to both source and
+                 * target equally, which can reverse the slide direction.
+                 * We compensate by subtracting the instrument's addNote from
+                 * the target note so the XM player arrives at the correct
+                 * un-shifted pitch after adding relativeNote back. */
+                int ch = item.chan;
+                if (ch < 0 || ch >= BASE_CHANS) ch = 0;
+                int rawNote = (item.note & 0x3f) + ts[t].trans;
+                int addNoteCompensation = 0;
+                if (chanLastMacro[ch] >= 0 && chanLastMacro[ch] < 128)
+                  addNoteCompensation = macroSI[chanLastMacro[ch]].addNote;
+                int xmNote = rawNote - addNoteCompensation + 25;
+                if (xmNote < 1) xmNote = 1;
+                if (xmNote > 96) xmNote = 96;
+                int portaRate  = item.detune;
+                int portaReset = item.ins;
+                if (portaReset < 1) portaReset = 1;
+                int xmParam = (portaRate * 5 + portaReset * 2)
+                              / (portaReset * 4);
+                if (xmParam < 1) xmParam = 1;
+                if (xmParam > 0xFF) xmParam = 0xFF;
+                if (totalXmRows < MAX_TOTAL_ROWS) {
+                  XMCell* cell = &bigGrid[totalXmRows * numChans + ch];
+                  cell->note = (unsigned char)xmNote;
+                  cell->inst = 0;
+                  cell->vol  = 0;
+                  cell->fx = 3;
+                  cell->param = (unsigned char)xmParam;
+                }
+                chanPortaActive[ch] = true;
+                chanPortaParam[ch] = xmParam;
+                break;
+              }
 
               {
                 /* Regular note event. TFMX note = 6-bit pitch + transposition.
@@ -1062,10 +1196,11 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
                     int idx = item.ins;
                     if (idx >= 0 && idx < 128) {
                       MacroEffectInfo& ef = macroFX[idx];
+                      bool isSweep = (macroSI[idx].sweepAmt != 0);
                       int effVol;
-                      if (ef.setVol >= 0)        effVol = ef.setVol;
-                      else if (ef.addVol != -999) effVol = ef.addVol + v * 3;
-                      else                        effVol = v * 3;
+                      if (ef.setVol >= 0 && !isSweep) effVol = ef.setVol;
+                      else if (ef.addVol != -999)     effVol = ef.addVol + v * 3;
+                      else                             effVol = v * 3;
                       if (effVol > 64) effVol = 64;
                       if (effVol < 0) effVol = 0;
                       chanEnv[ch].vol = effVol;
@@ -1074,12 +1209,17 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
                     }
                     chanEnv[ch].active = false;
                     chanAlive[ch] = true;
+                    chanPortaActive[ch] = false;
+                    chanLastMacro[ch] = item.ins;
                     lastEnveVol[ch] = scaleVol(chanEnv[ch].vol);
 
                     if (item.ins >= 0 && item.ins < 128) {
-                      bool isR = (ch & 1) ^ ((ch & 2) >> 1);
+                      bool isR = multimode ? (ch == 1 || ch == 2)
+                                           : (bool)((ch & 1) ^ ((ch & 2) >> 1));
                       if (isR) instPlayRight[item.ins]++;
                       else     instPlayLeft[item.ins]++;
+                      if (instFirstXmNote[item.ins] < 0)
+                        instFirstXmNote[item.ins] = xmNote;
                     }
 
                     int macIdx = item.ins;
@@ -1102,7 +1242,8 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
                         atkCell->vol  = (unsigned char)(0x10 + v);
                         int atkIdx = atkInstMap[macIdx] - 1;
                         if (atkIdx >= 0 && atkIdx < 128) {
-                          bool isR = (ch & 1) ^ ((ch & 2) >> 1);
+                          bool isR = multimode ? (ch == 1 || ch == 2)
+                                               : (bool)((ch & 1) ^ ((ch & 2) >> 1));
                           if (isR) instPlayRight[atkIdx]++;
                           else     instPlayLeft[atkIdx]++;
                         }
@@ -1122,7 +1263,8 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
                       cell->vol  = 0;
                       stutterUsed[ch] = true;
                       if (item.ins >= 0 && item.ins < 128) {
-                        bool isR = (ch & 1) ^ ((ch & 2) >> 1);
+                        bool isR = multimode ? (ch == 1 || ch == 2)
+                                             : (bool)((ch & 1) ^ ((ch & 2) >> 1));
                         if (isR) instPlayRight[item.ins]++;
                         else     instPlayLeft[item.ins]++;
                       }
@@ -1148,6 +1290,21 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
           }
         }
       }
+      /* Continue active portamento (XM effect 300) on empty cells.
+       * The initial 3xx was placed when the TFMX portamento note fired;
+       * here we repeat effect 300 on every subsequent row so the XM
+       * player keeps sliding toward the target pitch. */
+      if (totalXmRows < MAX_TOTAL_ROWS && !rowDone) {
+        for (int c = 0; c < BASE_CHANS; c++) {
+          if (!chanPortaActive[c]) continue;
+          XMCell* cell = &bigGrid[totalXmRows * numChans + c];
+          if (cell->note == 0 && cell->inst == 0 && cell->fx == 0) {
+            cell->fx = 3;
+            cell->param = 0;
+          }
+        }
+      }
+
       /* Apply active pEnve (pattern-level envelopes).
        * In real TFMX hardware, envelopes run per-frame (~50Hz), while
        * pattern commands run per-tick (every xmSpeed frames). So the
@@ -1177,29 +1334,19 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
                                   ? chanEnv[c].vol - chanEnv[c].amt : chanEnv[c].target;
               if (chanEnv[c].vol == chanEnv[c].target) {
                 chanEnv[c].active = false;
-                if (chanEnv[c].target == 0)
+                if (chanEnv[c].target == 0) {
                   chanAlive[c] = false;
+                  chanPortaActive[c] = false;
+                }
               }
             }
           }
-          /* Only write pEnve volumes if a note was placed on this channel
-           * recently. In TFMX every pEnve cycle is preceded by a note, but
-           * some notes are lost in conversion (e.g. when a track redirects
-           * via pPPat and the note timing doesn't align with our XM grid).
-           * Without this check, the pEnve would raise the volume of an old,
-           * decayed note — producing audible "ghost" tones. */
-          {
-            bool hasRecentNote = false;
-            int lookback = 32;
-            for (int back = 0; back <= lookback && (totalXmRows - back) >= 0; back++) {
-              XMCell* prev = &bigGrid[(totalXmRows - back) * numChans + c];
-              if (prev->note > 0 && prev->note < 97 && prev->inst > 0) {
-                hasRecentNote = true;
-                break;
-              }
-            }
-            if (!hasRecentNote) continue;
-          }
+          /* Skip pEnve writes when the channel has no active sound.
+           * chanAlive[c] is set true on note-on and cleared when pEnve
+           * reaches target 0, so it accurately tracks whether an audible
+           * sample is still playing — regardless of how many rows have
+           * passed since the last note event. */
+          if (!chanAlive[c]) continue;
           XMCell* cell = &bigGrid[totalXmRows * numChans + c];
           int v = chanEnv[c].vol;
           if (v < 0) v = 0;
@@ -1309,7 +1456,11 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
     int stutterDelayLeft = 0;
     int stutterFadeCycles = 0;
     int xmTicksPerRow = (xmSpeed > 1) ? (xmSpeed - 1) : 1;
-    bool isRight = (ch & 1) ^ ((ch & 2) >> 1);
+    bool isRight;
+    if (multimode)
+      isRight = (ch == 1 || ch == 2);  /* 7V: ch 1,2 = RIGHT; 0,4-7 = LEFT */
+    else
+      isRight = (ch & 1) ^ ((ch & 2) >> 1);  /* Amiga standard: 0,3=L  1,2=R */
     unsigned char panParam = isRight ? 0xD0 : 0x30;
 
     for (int row = 0; row < totalXmRows; row++) {
@@ -1331,10 +1482,12 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
           int rawPV = ((int)cell->vol - 0x10);
           if (rawPV < 0) rawPV = 0;
           int patVol = rawPV / 4;
+          bool isSweep = (fxIdx >= 0 && fxIdx < 128 &&
+                          macroSI[fxIdx].sweepAmt != 0);
           int effVol;
-          if (ef.setVol >= 0)        effVol = ef.setVol;
-          else if (ef.addVol != -999) effVol = ef.addVol + patVol * 3;
-          else                        effVol = patVol * 3;
+          if (ef.setVol >= 0 && !isSweep) effVol = ef.setVol;
+          else if (ef.addVol != -999)      effVol = ef.addVol + patVol * 3;
+          else                             effVol = patVol * 3;
           if (effVol > 64) effVol = 64;
           if (effVol < 0) effVol = 0;
           int scaledEV = scaleVol(effVol);
@@ -1679,8 +1832,9 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
   if (numPatterns > 256) numPatterns = 256;
   int songLen = numPatterns;
 
-  printf("XM-Export: %d total rows -> %d patterns (%d rows/pat), %d channels, speed=%d BPM=125\n",
-         totalXmRows, numPatterns, ROWS_PER_PAT, xmChans, xmSpeed);
+  printf("XM-Export: %d total rows -> %d patterns (%d rows/pat), %d channels, speed=%d BPM=%d%s\n",
+         totalXmRows, numPatterns, ROWS_PER_PAT, xmChans, xmSpeed, xmBPM,
+         multimode ? " [7V]" : "");
 
   /* XM header fields (at offset 60, inside the 276-byte header block) */
   writeU16(out, (unsigned short)songLen);  /* song length in patterns */
@@ -1692,7 +1846,7 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
   writeU16(out, 128);                      /* number of instruments */
   writeU16(out, 1);                        /* flags: 1 = linear frequency table */
   writeU16(out, (unsigned short)xmSpeed);  /* default speed (ticks/row) */
-  writeU16(out, 125);                      /* default BPM */
+  writeU16(out, (unsigned short)xmBPM);   /* default BPM */
 
   /* Order table: sequential pattern indices (0, 1, 2, ...) padded to 256 bytes */
   unsigned char order[256];
@@ -1810,42 +1964,69 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
       MacroSampleInfo& si2 = macroSI[inst];
       if (si2.sweepAmt > 0 && si2.sweepFrames > 0 && smpLen >= 4) {
         int origLen = smpLen;
-        int totalSweep = si2.sweepAmt * si2.sweepFrames;
-        int srcLen = origLen + totalSweep;
+        int hp = si2.sweepHalfPeriod;
+        bool pingPong = !si2.oneShot && hp > 0;
+        int maxOffset = pingPong ? (hp + 1) * si2.sweepAmt
+                                 : si2.sweepAmt * si2.sweepFrames;
+        int srcLen = origLen + maxOffset;
         if (smpStart + srcLen > (int)smplLen)
           srcLen = (int)smplLen - smpStart;
         if (srcLen > origLen) {
           const signed char* src = smpl + smpStart;
-          /* Amiga DMA loops the sample many times per frame for short
-           * waveforms.  Estimate loops-per-frame using ~256 bytes/frame
-           * (mid-range Amiga period at 50 Hz). */
-          int loopsPerFrame = 256 / origLen;
-          if (loopsPerFrame < 1) loopsPerFrame = 1;
-          int nFrames = si2.sweepFrames;
-          if (nFrames < 1) nFrames = 1;
-          int nLoops = nFrames * loopsPerFrame;
+          int baseNote = 49;
+          if (instFirstXmNote[inst] > 0)
+            baseNote = instFirstXmNote[inst];
+          int bytesPerFrame = (int)(256.0 * pow(2.0, (baseNote - 49 + relNote) / 12.0) + 0.5);
+          if (bytesPerFrame < 32) bytesPerFrame = 32;
+
+          int nFrames, nLoops;
+          if (pingPong) {
+            nFrames = 2 * hp;
+          } else {
+            nFrames = si2.sweepFrames;
+            if (nFrames < 1) nFrames = 1;
+          }
+          nLoops = (nFrames * bytesPerFrame + origLen - 1) / origLen;
           if (nLoops < 2) nLoops = 2;
-          if (nLoops > 512) nLoops = 512;
+          if (nLoops > 2048) nLoops = 2048;
           bakedLen = nLoops * origLen;
+          fprintf(stderr, "  sweep-bake inst=%d: baseNote=%d relNote=%d bpf=%d origLen=%d nFrames=%d nLoops=%d bakedLen=%d %s\n",
+                  inst, baseNote, relNote, bytesPerFrame, origLen, nFrames, nLoops, bakedLen,
+                  pingPong ? "PINGPONG" : "oneway");
           bakedBuf = (signed char*)malloc((size_t)bakedLen);
           if (bakedBuf) {
             int writePos = 0;
-            for (int frame = 0; frame < nFrames; frame++) {
-              int offset = frame * si2.sweepAmt;
-              for (int lp = 0; lp < loopsPerFrame; lp++) {
-                for (int b = 0; b < origLen; b++) {
-                  int readPos = offset + b;
-                  if (readPos < srcLen)
-                    bakedBuf[writePos++] = src[readPos];
-                  else
-                    bakedBuf[writePos++] = 0;
-                }
+            for (int lp = 0; lp < nLoops; lp++) {
+              int frame = (int)((double)lp * origLen / bytesPerFrame);
+              if (frame >= nFrames) frame = nFrames - 1;
+              int offset;
+              if (pingPong) {
+                int phase = frame % nFrames;
+                if (phase < hp)
+                  offset = (phase + 2) * si2.sweepAmt;
+                else
+                  offset = (nFrames - phase) * si2.sweepAmt;
+              } else {
+                offset = frame * si2.sweepAmt;
+              }
+              for (int b = 0; b < origLen; b++) {
+                int readPos = offset + b;
+                if (readPos >= 0 && readPos < srcLen)
+                  bakedBuf[writePos++] = src[readPos];
+                else
+                  bakedBuf[writePos++] = 0;
               }
             }
             smpLen = bakedLen;
-            loopType = 0;
-            xmLoopStart = 0;
-            xmLoopLen = 0;
+            if (si2.oneShot) {
+              loopType = 0;
+              xmLoopStart = 0;
+              xmLoopLen = 0;
+            } else {
+              loopType = 1;
+              xmLoopStart = 0;
+              xmLoopLen = (unsigned int)bakedLen;
+            }
           }
         }
       }
@@ -1889,10 +2070,10 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
 
     /* Write delta-encoded sample data */
     if (bakedBuf) {
-      unsigned char* delta = (unsigned char*)malloc((size_t)bakedLen);
+      unsigned char* delta = (unsigned char*)malloc((size_t)smpLen);
       if (delta) {
-        deltaEncode8(bakedBuf, bakedLen, delta);
-        fwrite(delta, 1, (size_t)bakedLen, out);
+        deltaEncode8(bakedBuf, smpLen, delta);
+        fwrite(delta, 1, (size_t)smpLen, out);
         free(delta);
       }
       free(bakedBuf);
