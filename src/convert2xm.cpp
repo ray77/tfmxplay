@@ -42,7 +42,7 @@
 #include "tfmx.h"
 
 #ifndef TFMXPLAY_VERSION
-#define TFMXPLAY_VERSION "0.0.2"
+#define TFMXPLAY_VERSION "0.0.3"
 #endif
 
 /* Win32 lacks arpa/inet.h — provide byte-swap helpers for big-endian TFMX data */
@@ -58,26 +58,21 @@ static unsigned int ntohl_win(unsigned int x) {
 #endif
 
 /*
- * Scale a linear TFMX volume (0-64) for XM output using a sqrt curve.
+ * Map TFMX volume (0-64) to XM volume (0-64) with a linear 4/3 gain boost.
  *
- * The TFMX player applies a 2x amplitude boost and crossfeed in its audio
- * output path that XM trackers don't replicate.  Additionally, with 12 XM
- * channels vs 4 Amiga channels, each channel contributes proportionally less
- * to the mix.  A sqrt curve compensates by boosting quieter volumes more than
- * loud ones, preserving the perceived dynamic balance — especially important
- * for pEnve fades where target volumes like 12/64 would otherwise sound far
- * too quiet relative to attack levels.
- *
- * Mapping examples:  0→0, 12→28, 35→47, 48→55, 64→64
+ * Both TFMX (Amiga hardware) and XM use a linear 0-64 volume register.
+ * The 4/3 factor compensates for the channel count difference: TFMX mixes
+ * 4 channels (2 per stereo side), while our XM has 9 channels.  A linear
+ * boost preserves the original dynamic *ratios* exactly — e.g. a chord pad
+ * fading from 35→12 (ratio 0.34) becomes 47→16 (ratio 0.34), unlike the
+ * old sqrt curve which compressed dynamics (47→28 = 0.60).
  */
 static int scaleVol(int v) {
   if (v <= 0) return 0;
   if (v >= 64) return 64;
-  double scaled = sqrt((double)v / 64.0) * 64.0;
-  int result = (int)(scaled + 0.5);
-  if (result > 64) result = 64;
-  if (result < 1) result = 1;
-  return result;
+  int r = (v * 4 + 2) / 3;
+  if (r > 64) r = 64;
+  return r;
 }
 
 /* XM uses little-endian byte order throughout */
@@ -112,6 +107,8 @@ struct MacroSampleInfo {
   int atkStart;    /* attack phase sample offset in smpl (-1 = none) */
   int atkLen;      /* attack phase sample length in bytes */
   int setNoteVal;  /* mSetNote value before mOn; -1 = no fixed attack pitch */
+  int sweepAmt;    /* mAddBegin: bytes per frame to shift loop start (0=none) */
+  int sweepFrames; /* frames of sweep before mOneShot/mStop */
 };
 
 /*
@@ -136,7 +133,15 @@ struct MacroEffectInfo {
   int vibDepth;       /* XM vibrato depth (effect 4, low nibble) */
   int sustainSlide;   /* volume slide per row during sustain; negative = down */
   int sustainDelay;   /* rows to wait before sustain slide begins (from mWait) */
+  int sustainTarget;  /* TFMX envelope target vol (0-64); slide stops here */
   int releaseSlide;   /* volume slide per row after pKeyUp; negative = down */
+  int releaseTarget;  /* volume where first release stage stops (0 = fade to 0) */
+  int releaseSlide2;  /* second release stage: slide from releaseTarget to 0 */
+  int stutterOnFrames;  /* frames of sound per stutter cycle; 0 = no stutter */
+  int stutterOffFrames; /* frames of silence per stutter cycle */
+  int stutterVol;       /* volume during the "on" phase of stutter (0-64) */
+  int stutterDelay;     /* macro frames before stutter loop starts */
+  int stutterFadeCycles;/* cycles until stutter silences (from mAddBegin) */
 };
 
 /*
@@ -150,13 +155,15 @@ struct MacroEffectInfo {
  * that the listener perceives as the instrument's timbre.
  */
 static MacroSampleInfo getMacroSample(const TFMXMacroData macro[256]) {
-  MacroSampleInfo info = { 0, 512, 0, 0, false, false, 0, -1, 0, -1 };
+  MacroSampleInfo info = { 0, 512, 0, 0, false, false, 0, -1, 0, -1, 0, 0 };
   int curStart = 0;
   int curLenWords = 256;   /* TFMX lengths are in 16-bit words */
   bool gotAny = false;
-  bool gotAddNote = false;
+  int addNotePreOn = 0;    /* mAddNote before mOn (used if no post-mOn) */
+  int addNotePostOn = -999; /* mAddNote after mOn — preferred for sustain */
   bool afterOn = false;
   int preOnSetNote = -1;   /* mSetNote value found before mOn */
+  bool gotAddBegin = false;
 
   int onStart = 0, onLen = 512;
   int postStart = -1, postLen = -1;
@@ -195,10 +202,32 @@ static MacroSampleInfo getMacroSample(const TFMXMacroData macro[256]) {
       case mOneShot:
         info.oneShot = true;
         break;
-      case mAddNote:
-        if (!gotAddNote) {
-          info.addNote = (signed char)macro[i].data[0];
-          gotAddNote = true;
+      case mAddNote: {
+        int val = (signed char)macro[i].data[0];
+        if (afterOn)
+          addNotePostOn = val;
+        else
+          addNotePreOn = val;
+        break;
+      }
+      case mAddBegin:
+        if (afterOn && !gotAddBegin && macro[i].data[0] > 0) {
+          int amt = (signed short)((macro[i].data[1]<<8)|macro[i].data[2]);
+          if (amt > 0) {
+            info.sweepAmt = amt;
+            int frames = 0;
+            for (int j = i + 1; j < 256; j++) {
+              if (macro[j].op == mWait) {
+                int w = (macro[j].data[0]<<16)|(macro[j].data[1]<<8)|macro[j].data[2];
+                frames += w + 1;
+              } else if (macro[j].op == mOneShot || macro[j].op == mStop) {
+                break;
+              }
+            }
+            if (frames <= 0) frames = 40;
+            info.sweepFrames = frames;
+          }
+          gotAddBegin = true;
         }
         break;
       case mStop:
@@ -228,20 +257,25 @@ done:
     info.start = curStart;
     info.len = curLenWords * 2;
   }
+  /* Prefer post-mOn mAddNote for sustain (runs during playback); fall back
+   * to pre-mOn if no post-mOn mAddNote exists. */
+  info.addNote = (addNotePostOn != -999) ? addNotePostOn : addNotePreOn;
   return info;
 }
 
 /*
  * Convert a TFMX per-tick envelope rate to an XM per-row volume slide speed.
  *
- * TFMX applies envAmt every (envTimeC+1) ticks. XM applies the volume slide
- * once per row, which lasts (xmSpeed-1) ticks (first tick is the trigger).
- * We scale so the total volume change over the same wall-clock time matches.
+ * TFMX applies envAmt every (envTimeC+1) frames.  XM volume slide runs on
+ * ticks 1..(xmSpeed-1), giving (xmSpeed-1) applications per row.  Combining
+ * into a single fraction avoids premature integer truncation:
+ *   speed = round( envAmt * xmSpeed / ((timeC+1) * (xmSpeed-1)) )
  * Result is clamped to XM's 1-15 range.
  */
 static int calcEnvSpeed(int envAmt, int envTimeC, int xmSpeed) {
-  int denom = (envTimeC + 1) * (xmSpeed > 1 ? (xmSpeed - 1) : 1);
-  int speed = (envAmt * xmSpeed + denom - 1) / denom;
+  int xmTicksPerRow = (xmSpeed > 1) ? (xmSpeed - 1) : 1;
+  int denom = (envTimeC + 1) * xmTicksPerRow;
+  int speed = (envAmt * xmSpeed + denom / 2) / denom;
   if (speed < 1) speed = 1;
   if (speed > 15) speed = 15;
   return speed;
@@ -264,29 +298,29 @@ static int calcEnvSpeed(int envAmt, int envTimeC, int xmSpeed) {
  * mOn override the initial attack phase and represent the sustained sound.
  */
 static MacroEffectInfo getMacroEffects(const TFMXMacroData macro[256], int xmSpeed) {
-  MacroEffectInfo fx = {-999, -1, 0, 0, 0, 0, 0};
+  MacroEffectInfo fx = {-999, -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
   bool foundVib = false;
   bool afterOn = false;
   bool afterWaitUp = false;
   bool foundSustainEnv = false;
+  bool foundReleaseEnv = false;
   int waitBeforeFirstEnv = 0;
 
   for (int i = 0; i < 256; i++) {
     switch (macro[i].op) {
       case mAddVol:
-        /* For multi-phase macros, use the LAST addVol (sustain phase) */
-        fx.addVol = (signed char)macro[i].data[2];  /* SIGNED! 252 → -4 */
-        fx.setVol = -1; /* addVol overrides setVol */
+        fx.addVol = (signed char)macro[i].data[2];
+        fx.setVol = -1;
         break;
       case mSetVol:
         fx.setVol = macro[i].data[2];
-        fx.addVol = -999; /* setVol overrides addVol */
+        fx.addVol = -999;
         break;
       case mOn:
         afterOn = true;
         break;
       case mWait:
-        if (afterOn && !foundSustainEnv) {
+        if (afterOn && !foundSustainEnv && !afterWaitUp) {
           int w = (macro[i].data[0]<<16)|(macro[i].data[1]<<8)|(macro[i].data[2]);
           waitBeforeFirstEnv += w + 1;
         }
@@ -294,12 +328,16 @@ static MacroEffectInfo getMacroEffects(const TFMXMacroData macro[256], int xmSpe
       case mWaitUp:
         afterWaitUp = true;
         break;
+      case mLoopUp:
+        /* mLoopUp(0,...) is an unconditional jump gated by keyon — it acts
+         * as a "sustain hold" loop that only breaks when pKeyUp fires.
+         * Everything after it is effectively the release phase. */
+        if (macro[i].data[0] == 0)
+          afterWaitUp = true;
+        break;
       case mWaitSample:
         break;
       case mVibrato: {
-        /* TFMX vibrato: data[0]=period (ticks per half-cycle, bit0 ignored),
-         * data[2]=amplitude. XM effect 4xy: x=speed (higher=faster),
-         * y=depth. We approximate the rate and depth mapping. */
         if (!foundVib) {
           int timeC = macro[i].data[0] & 0xfe;
           int amt = macro[i].data[2];
@@ -316,21 +354,16 @@ static MacroEffectInfo getMacroEffects(const TFMXMacroData macro[256], int xmSpe
         break;
       }
       case mEnv: {
-        /* mEnv: data[0]=amount, data[1]=time counter, data[2]=target volume.
-         * TFMX adjusts volume by 'amount' every (timeC+1) ticks toward target.
-         *
-         * Before mWaitUp: this is the sustain envelope (applied while note
-         * is held — e.g., a slow fade from full volume to a sustain level).
-         * After mWaitUp: this is the release envelope (applied after pKeyUp
-         * — typically a fast fade to 0). */
         int envAmt = macro[i].data[0];
         int envTimeC = macro[i].data[1];
         int envTarget = macro[i].data[2];
         int speed = calcEnvSpeed(envAmt, envTimeC, xmSpeed);
 
         if (!foundSustainEnv && !afterWaitUp) {
+          /* Sustain envelope: applied while keyon, before pKeyUp */
           fx.sustainDelay = (waitBeforeFirstEnv + xmSpeed - 1) / xmSpeed;
           if (fx.sustainDelay > 16) fx.sustainDelay = 16;
+          fx.sustainTarget = envTarget;
           if (envTarget == 0) {
             fx.sustainSlide = -speed;
           } else {
@@ -339,8 +372,19 @@ static MacroEffectInfo getMacroEffects(const TFMXMacroData macro[256], int xmSpe
             fx.sustainSlide = (envTarget > initVol) ? speed : -speed;
           }
           foundSustainEnv = true;
-        } else if (afterWaitUp && envTarget == 0) {
-          fx.releaseSlide = -speed;
+        } else if (afterWaitUp && !foundReleaseEnv) {
+          /* First release envelope (may target a non-zero volume) */
+          fx.releaseTarget = envTarget;
+          fx.releaseSlide = (envTarget == 0) ? -speed : -speed;
+          if (envTarget > 0) {
+            int initVol = (fx.addVol != -999) ? fx.addVol + 24 :
+                          (fx.setVol >= 0) ? fx.setVol : 48;
+            fx.releaseSlide = (envTarget < initVol) ? -speed : speed;
+          }
+          foundReleaseEnv = true;
+        } else if (afterWaitUp && foundReleaseEnv && envTarget == 0) {
+          /* Second release envelope: slow fade from releaseTarget to 0 */
+          fx.releaseSlide2 = -speed;
         }
         break;
       }
@@ -349,11 +393,89 @@ static MacroEffectInfo getMacroEffects(const TFMXMacroData macro[256], int xmSpe
     }
   }
 efxdone:
-  /* If the macro has a sustain fade but no explicit release envelope,
+  /* If the macro has a sustain fade to 0 but no explicit release envelope,
    * reuse the sustain slide as the release — otherwise notes hang forever. */
-  if (fx.releaseSlide == 0 && foundSustainEnv && fx.sustainSlide < 0) {
+  if (fx.releaseSlide == 0 && foundSustainEnv && fx.sustainSlide < 0
+      && fx.sustainTarget == 0) {
     fx.releaseSlide = fx.sustainSlide;
   }
+  /* If the first release stage stops at a non-zero volume but there is no
+   * explicit second stage, continue fading at the same speed so the note
+   * actually silences (XM has no "hold at release level" concept). */
+  if (fx.releaseSlide != 0 && fx.releaseTarget > 0 && fx.releaseSlide2 == 0) {
+    fx.releaseSlide2 = fx.releaseSlide;
+  }
+
+  /* Detect stutter pattern: mSetVol(0) → mWait → mSetVol(V>0) → mWait → mLoop.
+   * Common in TFMX for tremolo-like pulsing pads (e.g., T2 World5 macros 68/69).
+   * We record the timing so Phase 2 can emit alternating volumes. */
+  {
+    int totalFramesBefore = 0;
+    bool pastOn = false;
+    for (int i = 0; i < 255; i++) {
+      if (macro[i].op == mOn) pastOn = true;
+      if (!pastOn && macro[i].op == mWait) {
+        int w = (macro[i].data[0]<<16)|(macro[i].data[1]<<8)|macro[i].data[2];
+        totalFramesBefore += w + 1;
+      }
+      if (pastOn && macro[i].op == mWait) {
+        int w = (macro[i].data[0]<<16)|(macro[i].data[1]<<8)|macro[i].data[2];
+        totalFramesBefore += w + 1;
+      }
+      /* Pattern: [mAddBegin] mSetVol(0) mWait mSetVol(V) mWait mLoop */
+      if (macro[i].op == mSetVol && macro[i].data[2] == 0 && pastOn) {
+        int addBeginStep = 0;
+        if (i > 0 && macro[i-1].op == mAddBegin)
+          addBeginStep = (macro[i-1].data[0]<<16)|(macro[i-1].data[1]<<8)|macro[i-1].data[2];
+        int j = i + 1;
+        if (j < 255 && macro[j].op == mWait) {
+          int offW = (macro[j].data[0]<<16)|(macro[j].data[1]<<8)|macro[j].data[2];
+          int offFrames = offW + 1;
+          j++;
+          if (j < 255 && macro[j].op == mSetVol && macro[j].data[2] > 0) {
+            int onVol = macro[j].data[2];
+            j++;
+            if (j < 255 && macro[j].op == mWait) {
+              int onW = (macro[j].data[0]<<16)|(macro[j].data[1]<<8)|macro[j].data[2];
+              int onFrames = onW + 1;
+              j++;
+              if (j < 256 && macro[j].op == mLoop) {
+                fx.stutterOffFrames = offFrames;
+                fx.stutterOnFrames  = onFrames;
+                fx.stutterVol       = onVol;
+                fx.stutterDelay     = totalFramesBefore;
+                fx.stutterFadeCycles = 0;
+                if (addBeginStep > 0) {
+                  int smpBytes = 0;
+                  for (int k = 0; k < i; k++) {
+                    if (macro[k].op == mSetLen)
+                      smpBytes = ((macro[k].data[1]<<8)|macro[k].data[2]) * 2;
+                  }
+                  if (smpBytes > 0)
+                    fx.stutterFadeCycles = smpBytes / addBeginStep;
+                }
+                /* The stutter loop's mSetVol commands overwrote addVol/setVol.
+                 * Restore the initial volume from before the stutter pattern
+                 * so note trigger volume is computed from mAddVol, not mSetVol. */
+                for (int k = 0; k < i; k++) {
+                  if (macro[k].op == mAddVol) {
+                    fx.addVol = (signed char)macro[k].data[2];
+                    fx.setVol = -1;
+                  } else if (macro[k].op == mSetVol) {
+                    fx.setVol = macro[k].data[2];
+                    fx.addVol = -999;
+                  }
+                }
+                break;
+              }
+            }
+          }
+        }
+      }
+      if (macro[i].op == mStop) break;
+    }
+  }
+
   return fx;
 }
 
@@ -578,7 +700,8 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
   const int MAX_TOTAL_ROWS = ROWS_PER_PAT * 256;
   const int BASE_CHANS = 8;    /* original TFMX channels */
   const int OVERFLOW_CHANS = 4; /* attack transients: only Amiga ch 0–3 → XM ch 9–12 */
-  int numChans = BASE_CHANS + OVERFLOW_CHANS;
+  const int STUTTER_CHANS = 4; /* pulsing pads: Amiga ch 0–3 → XM ch 13–16 */
+  int numChans = BASE_CHANS + OVERFLOW_CHANS + STUTTER_CHANS;
 
   /* One cell per channel per row — matches XM's packed pattern cell format */
   struct XMCell { unsigned char note, inst, vol, fx, param; };
@@ -623,6 +746,7 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
   };
   ChanEnv chanEnv[8];
   bool chanAlive[8];
+  bool stutterUsed[4] = {false, false, false, false};
   int lastEnveVol[8]; /* last scaled volume written by pEnve, for computing slides */
   for (int c = 0; c < 8; c++) {
     chanEnv[c].active = false;
@@ -645,7 +769,15 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
    * Needed before simulation so pEnve can initialize chanEnv.vol to the
    * correct effective volume (accounting for mAddVol/mSetVol). */
   MacroEffectInfo macroFX[128];
-  for (int i = 0; i < 128; i++) macroFX[i] = getMacroEffects(macro[i], xmSpeed);
+  bool macroHasOn[128];
+  for (int i = 0; i < 128; i++) {
+    macroFX[i] = getMacroEffects(macro[i], xmSpeed);
+    macroHasOn[i] = false;
+    for (int j = 0; j < 256; j++) {
+      if (macro[i][j].op == mOn) { macroHasOn[i] = true; break; }
+      if (macro[i][j].op == mStop) break;
+    }
+  }
 
   /* Pre-compute sample info for all macros (needed for attack overflow).
    * For macros with mSetNote before mOn, the pre-mOn sample is a fixed-pitch
@@ -672,6 +804,18 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
     if (as != ss && al > sl && sl >= 256)
       continue; /* attack block longer than sustain body — bogus */
     atkInstMap[i] = i + 64 + 1;
+  }
+
+  /* Map attack instrument indices back to their parent macro so Phase 2
+   * can look up the correct volume effects (addVol/setVol). */
+  int atkParentMacro[128];
+  memset(atkParentMacro, -1, sizeof(atkParentMacro));
+  for (int i = 0; i < 128; i++) {
+    if (atkInstMap[i] > 0) {
+      int atkIdx = atkInstMap[i] - 1;
+      if (atkIdx >= 0 && atkIdx < 128)
+        atkParentMacro[atkIdx] = i;
+    }
   }
 
   /* Track which stereo side each instrument plays on so we can bake the
@@ -834,9 +978,6 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
               }
               break;
             case pEnve: {
-              /* Pattern-level volume envelope: ramp the target channel's volume
-               * from its current level toward 'detune' by 'ins' units every
-               * (vol+1) ticks. Used for chord pad fades and other gradual changes. */
               int ch = item.chan;
               if (ch >= 0 && ch < BASE_CHANS) {
                 chanEnv[ch].amt = item.ins;
@@ -908,59 +1049,91 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
                 if (ch < 0 || ch >= BASE_CHANS) ch = 0;
                 if (totalXmRows < MAX_TOTAL_ROWS) {
                   XMCell* cell = &bigGrid[totalXmRows * numChans + ch];
-                  cell->note = (unsigned char)xmNote;
-                  cell->inst = (unsigned char)(item.ins + 1);
-                  /* Preliminary volume from pattern data (patVol * 4).
-                   * This will be corrected to effective volume in post-processing. */
-                  int v = item.vol;
-                  cell->vol = (unsigned char)(0x10 + v * 4);
-                  if (cell->vol > 0x50) cell->vol = 0x50;
-                  /* Initialize the pEnve envelope volume to the effective
-                   * TFMX volume (accounting for macro mAddVol/mSetVol),
-                   * so pattern envelopes fade from the correct starting level. */
-                  int idx = item.ins;
-                  if (idx >= 0 && idx < 128) {
-                    MacroEffectInfo& ef = macroFX[idx];
-                    int effVol;
-                    if (ef.setVol >= 0)        effVol = ef.setVol;
-                    else if (ef.addVol != -999) effVol = ef.addVol + v * 3;
-                    else                        effVol = v * 3;
-                    if (effVol > 64) effVol = 64;
-                    if (effVol < 0) effVol = 0;
-                    chanEnv[ch].vol = effVol;
-                  } else {
-                    chanEnv[ch].vol = v * 4;
-                  }
-                  chanEnv[ch].active = false;
-                  chanAlive[ch] = true;
-                  lastEnveVol[ch] = scaleVol(chanEnv[ch].vol);
 
-                  /* Track stereo side for sample-header panning */
-                  if (item.ins >= 0 && item.ins < 128) {
-                    bool isR = (ch & 1) ^ ((ch & 2) >> 1);
-                    if (isR) instPlayRight[item.ins]++;
-                    else     instPlayLeft[item.ins]++;
-                  }
+                  
+                  bool emptyMacro = (item.ins >= 0 && item.ins < 128 &&
+                                     !macroHasOn[item.ins]);
+                  if (!emptyMacro) {
+                    cell->note = (unsigned char)xmNote;
+                    cell->inst = (unsigned char)(item.ins + 1);
+                    int v = item.vol;
+                    cell->vol = (unsigned char)(0x10 + v * 4);
+                    if (cell->vol > 0x50) cell->vol = 0x50;
+                    int idx = item.ins;
+                    if (idx >= 0 && idx < 128) {
+                      MacroEffectInfo& ef = macroFX[idx];
+                      int effVol;
+                      if (ef.setVol >= 0)        effVol = ef.setVol;
+                      else if (ef.addVol != -999) effVol = ef.addVol + v * 3;
+                      else                        effVol = v * 3;
+                      if (effVol > 64) effVol = 64;
+                      if (effVol < 0) effVol = 0;
+                      chanEnv[ch].vol = effVol;
+                    } else {
+                      chanEnv[ch].vol = v * 4;
+                    }
+                    chanEnv[ch].active = false;
+                    chanAlive[ch] = true;
+                    lastEnveVol[ch] = scaleVol(chanEnv[ch].vol);
 
-                  /* Multi-phase attack: mSetNote-before-mOn → one-shot on overflow.
-                   * Only four overflow columns (XM 9–12): Amiga ch 0–3.  Ch 4–7 keep
-                   * sustain-only on the main column (no extra XM channels). */
-                  int macIdx = item.ins;
-                  if (macIdx >= 0 && macIdx < 128 && atkInstMap[macIdx] > 0 &&
-                      ch >= 0 && ch < OVERFLOW_CHANS) {
-                    int ovfCh = BASE_CHANS + ch;
-                    int atkNote = macroSI[macIdx].setNoteVal + 25;
-                    if (atkNote >= 1 && atkNote <= 96) {
-                      XMCell* atkCell = &bigGrid[totalXmRows * numChans + ovfCh];
-                      atkCell->note = (unsigned char)atkNote;
-                      atkCell->inst = (unsigned char)atkInstMap[macIdx];
-                      atkCell->vol  = cell->vol;
-                      int atkIdx = atkInstMap[macIdx] - 1;
-                      if (atkIdx >= 0 && atkIdx < 128) {
-                        bool isR = (ch & 1) ^ ((ch & 2) >> 1);
-                        if (isR) instPlayRight[atkIdx]++;
-                        else     instPlayLeft[atkIdx]++;
+                    if (item.ins >= 0 && item.ins < 128) {
+                      bool isR = (ch & 1) ^ ((ch & 2) >> 1);
+                      if (isR) instPlayRight[item.ins]++;
+                      else     instPlayLeft[item.ins]++;
+                    }
+
+                    int macIdx = item.ins;
+                    if (macIdx >= 0 && macIdx < 128 && atkInstMap[macIdx] > 0 &&
+                        ch >= 0 && ch < OVERFLOW_CHANS) {
+                      int ovfCh = BASE_CHANS + ch;
+                      int atkNote = macroSI[macIdx].setNoteVal + 25;
+                      if (atkNote >= 1 && atkNote <= 96) {
+                        XMCell* atkCell = &bigGrid[totalXmRows * numChans + ovfCh];
+                        atkCell->note = (unsigned char)atkNote;
+                        atkCell->inst = (unsigned char)atkInstMap[macIdx];
+                        /* Only halve volume when attack and sustain overlap
+                         * (same sample region) — those sound doubled.  Distinct
+                         * attacks (e.g. snare click) keep full volume. */
+                        MacroSampleInfo& siAtk = macroSI[macIdx];
+                        bool doubled = (siAtk.atkStart == siAtk.start);
+                        int v = (int)cell->vol - 0x10;
+                        if (v < 0) v = 0;
+                        if (doubled) v = v / 2;
+                        atkCell->vol  = (unsigned char)(0x10 + v);
+                        int atkIdx = atkInstMap[macIdx] - 1;
+                        if (atkIdx >= 0 && atkIdx < 128) {
+                          bool isR = (ch & 1) ^ ((ch & 2) >> 1);
+                          if (isR) instPlayRight[atkIdx]++;
+                          else     instPlayLeft[atkIdx]++;
+                        }
                       }
+                    }
+
+                    if (macIdx >= 0 && macIdx < 128 &&
+                        macroFX[macIdx].stutterOnFrames > 0 &&
+                        ch >= 0 && ch < STUTTER_CHANS) {
+                      int stCh = BASE_CHANS + OVERFLOW_CHANS + ch;
+                      XMCell* stCell = &bigGrid[totalXmRows * numChans + stCh];
+                      stCell->note = cell->note;
+                      stCell->inst = cell->inst;
+                      stCell->vol  = cell->vol;
+                      cell->note = 0;
+                      cell->inst = 0;
+                      cell->vol  = 0;
+                      stutterUsed[ch] = true;
+                      if (item.ins >= 0 && item.ins < 128) {
+                        bool isR = (ch & 1) ^ ((ch & 2) >> 1);
+                        if (isR) instPlayRight[item.ins]++;
+                        else     instPlayLeft[item.ins]++;
+                      }
+                    } else if (macIdx >= 0 && macIdx < 128 &&
+                               macroFX[macIdx].stutterOnFrames == 0 &&
+                               ch >= 0 && ch < STUTTER_CHANS &&
+                               stutterUsed[ch]) {
+                      int stCh = BASE_CHANS + OVERFLOW_CHANS + ch;
+                      XMCell* stCell = &bigGrid[totalXmRows * numChans + stCh];
+                      if (stCell->note == 0)
+                        stCell->vol = 0x10;
                     }
                   }
                 }
@@ -1028,21 +1201,15 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
             if (!hasRecentNote) continue;
           }
           XMCell* cell = &bigGrid[totalXmRows * numChans + c];
+          int v = chanEnv[c].vol;
+          if (v < 0) v = 0;
+          if (v > 64) v = 64;
+          int newScaled = scaleVol(v);
+          int delta = lastEnveVol[c] - newScaled;
+          int slideTicks = (xmSpeed > 1) ? (xmSpeed - 1) : 1;
           if (cell->note == 0 && cell->inst == 0 && cell->vol == 0) {
-            int v = chanEnv[c].vol;
-            if (v < 0) v = 0;
-            if (v > 64) v = 64;
-            int newScaled = scaleVol(v);
-            int delta = lastEnveVol[c] - newScaled;
-            int slideTicks = (xmSpeed > 1) ? (xmSpeed - 1) : 1;
             if (delta > 0) {
               int speed = (delta + slideTicks - 1) / slideTicks;
-              /* minRows war 7 → Pads wirkten ewig; 3 = kürzeres Akkord-Ende */
-              const int minRows = 3;
-              if (delta > slideTicks * 2 && speed > 1) {
-                int cap = (delta + minRows * slideTicks - 1) / (minRows * slideTicks);
-                if (cap >= 1 && cap < speed) speed = cap;
-              }
               if (speed >= 1 && speed <= 15) {
                 cell->vol = (unsigned char)(0x60 + speed);
                 lastEnveVol[c] -= speed * slideTicks;
@@ -1062,7 +1229,25 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
                 lastEnveVol[c] = newScaled;
               }
             }
-            /* delta == 0: no change needed, leave cell empty */
+          } else if (cell->note > 0 && cell->note < 97 && cell->inst > 0
+                     && cell->fx == 0 && delta != 0) {
+            if (delta > 0) {
+              int speed = (delta + slideTicks - 1) / slideTicks;
+              if (speed < 1) speed = 1;
+              if (speed > 15) speed = 15;
+              cell->fx = 0x0A;
+              cell->param = (unsigned char)speed;
+              lastEnveVol[c] -= speed * slideTicks;
+              if (lastEnveVol[c] < 0) lastEnveVol[c] = 0;
+            } else {
+              int speed = ((-delta) + slideTicks - 1) / slideTicks;
+              if (speed < 1) speed = 1;
+              if (speed > 15) speed = 15;
+              cell->fx = 0x0A;
+              cell->param = (unsigned char)(speed << 4);
+              lastEnveVol[c] += speed * slideTicks;
+              if (lastEnveVol[c] > 64) lastEnveVol[c] = 64;
+            }
           }
         }
       }
@@ -1112,20 +1297,33 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
     int envSlide = 0;
     int envDelayLeft = 0;
     int releaseSlide = 0;
+    int releaseTargetVol = 0;
+    int releaseSlide2 = 0;
     bool inRelease = false;
+    bool inRelease2 = false;
+    int sustainTargetVol = 0;
     int curVibS = 0, curVibD = 0;
-    int runningVol = 0; /* track actual volume to stop slides at 0 */
+    int runningVol = 0;
+    int stutterOn = 0, stutterOff = 0, stutterVol = 0;
+    int stutterPhase = 0;
+    int stutterDelayLeft = 0;
+    int stutterFadeCycles = 0;
+    int xmTicksPerRow = (xmSpeed > 1) ? (xmSpeed - 1) : 1;
     bool isRight = (ch & 1) ^ ((ch & 2) >> 1);
     unsigned char panParam = isRight ? 0xD0 : 0x30;
 
     for (int row = 0; row < totalXmRows; row++) {
       XMCell* cell = &bigGrid[row * numChans + ch];
 
+
+
       if (cell->note > 0 && cell->note < 97 && cell->inst > 0) {
         /* --- New note: compute effective volume and set up effects --- */
         int idx = cell->inst - 1;
         if (idx >= 0 && idx < 128) {
-          MacroEffectInfo& ef = macroFX[idx];
+          /* Attack instruments use their parent macro's volume effects */
+          int fxIdx = (atkParentMacro[idx] >= 0) ? atkParentMacro[idx] : idx;
+          MacroEffectInfo& ef = macroFX[fxIdx];
 
           /* Recover the original TFMX patVol (0-15) from the preliminary
            * volume we stored during simulation, then compute the effective
@@ -1142,11 +1340,11 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
           int scaledEV = scaleVol(effVol);
           cell->vol = (unsigned char)(0x10 + scaledEV);
           runningVol = scaledEV;
-
-          /* Panning: only needed for instruments that play on both stereo
-           * sides.  For single-side instruments, the sample header provides
-           * the correct panning on note trigger automatically. */
-          if (instNeedsPanFx[idx]) {
+          /* Panning: write 8xx to effect column when free, so panning is
+           * explicit per note.  Use channel-derived panParam (left/right).
+           * For mixed instruments we use panParam; for single-side we also
+           * use panParam so the effect column matches the channel. */
+          if (cell->fx == 0) {
             cell->fx = 8;
             cell->param = panParam;
           }
@@ -1168,25 +1366,62 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
             vibPending = false;
           }
 
+          /* If Phase 1 placed a pEnve volume slide (Axy) on the note row,
+           * adjust runningVol so Phase 2 tracking stays in sync. */
+          if (cell->fx == 0x0A) {
+            int slideDown = cell->param & 0x0F;
+            int slideUp   = (cell->param >> 4) & 0x0F;
+            runningVol += (slideUp - slideDown) * xmTicksPerRow;
+            if (runningVol < 0) runningVol = 0;
+            if (runningVol > 64) runningVol = 64;
+          }
+
           /* Set up sustain and release envelope state for this note.
-           * Scale slide speed proportionally so release duration stays the
-           * same despite the boosted initial volume. */
+           * Scale slide speed proportionally so duration stays the same
+           * despite the boosted volume.  For fade-ins (effVol=0, slide>0),
+           * scale against the target volume instead. */
           envSlide = ef.sustainSlide;
-          if (envSlide != 0 && effVol > 0) {
-            int s = (abs(envSlide) * scaledEV * 2 + effVol * 5 - 1) / (effVol * 5);
-            if (s < 1) s = 1;
-            if (s > 15) s = 15;
-            envSlide = (envSlide < 0) ? -s : s;
+          sustainTargetVol = scaleVol(ef.sustainTarget);
+          if (envSlide != 0) {
+            int refVol = effVol;
+            int refScaled = scaledEV;
+            if (refVol <= 0 && ef.sustainTarget > 0) {
+              refVol = ef.sustainTarget;
+              refScaled = sustainTargetVol;
+            }
+            if (refVol > 0) {
+              int s = (abs(envSlide) * refScaled + refVol / 2) / refVol;
+              if (s < 1) s = 1;
+              if (s > 15) s = 15;
+              envSlide = (envSlide < 0) ? -s : s;
+            }
           }
           envDelayLeft = ef.sustainDelay;
           releaseSlide = ef.releaseSlide;
+          releaseTargetVol = scaleVol(ef.releaseTarget);
+          releaseSlide2 = ef.releaseSlide2;
           if (releaseSlide != 0 && effVol > 0) {
-            int s = (abs(releaseSlide) * scaledEV * 2 + effVol * 5 - 1) / (effVol * 5);
+            int s = (abs(releaseSlide) * scaledEV + effVol / 2) / effVol;
             if (s < 1) s = 1;
             if (s > 15) s = 15;
             releaseSlide = (releaseSlide < 0) ? -s : s;
           }
+          if (releaseSlide2 != 0 && effVol > 0) {
+            int s = (abs(releaseSlide2) * scaledEV + effVol / 2) / effVol;
+            if (s < 1) s = 1;
+            if (s > 15) s = 15;
+            releaseSlide2 = (releaseSlide2 < 0) ? -s : s;
+          }
           inRelease = false;
+          inRelease2 = false;
+
+          /* Set up stutter (mSetVol 0/N pulsing) */
+          stutterOn = ef.stutterOnFrames;
+          stutterOff = ef.stutterOffFrames;
+          stutterVol = ef.stutterVol;
+          stutterPhase = 0;
+          stutterDelayLeft = ef.stutterDelay;
+          stutterFadeCycles = ef.stutterFadeCycles;
         }
       } else if (cell->note == 97) {
         /* --- Key-up event (from pKeyUp): switch to release envelope ---
@@ -1196,35 +1431,21 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
         cell->note = 0;
         if (releaseSlide != 0) {
           int rs = releaseSlide;
-          int cap = 15;
-          if (rs < -cap) rs = -cap;
-          else if (rs > cap) rs = cap;
-          /* Schnelleres Auskl. als TFMX-Macro (ca. ×1,4 zum Mapping) */
-          if (rs < 0) {
-            int m = (-rs * 7 + 4) / 5;
-            if (m < 1) m = 1;
-            if (m > 15) m = 15;
-            rs = -m;
-          }
+          if (rs < -15) rs = -15;
+          else if (rs > 15) rs = 15;
           envSlide = rs;
           envDelayLeft = 0;
           inRelease = true;
         } else if (envSlide < 0) {
-          if (envSlide < -1) {
-            int m = (-envSlide * 7 + 4) / 5;
-            if (m < 1) m = 1;
-            if (m > 15) m = 15;
-            envSlide = -m;
-          }
           inRelease = true;
         } else {
-          envSlide = -6;
+          int s = 4;
           if (runningVol > 0) {
-            int s = (runningVol + 1) / 2;
-            if (s < 3) s = 3;
+            s = (runningVol + xmTicksPerRow * 3 - 1) / (xmTicksPerRow * 3);
+            if (s < 2) s = 2;
             if (s > 15) s = 15;
-            envSlide = -s;
           }
+          envSlide = -s;
           inRelease = true;
         }
         vibActive = false;
@@ -1241,29 +1462,146 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
           cell->fx = 4;
           cell->param = 0;
         }
-        /* Volume envelope slide: track running volume and stop at 0.
-         * Without this, slides continue endlessly across section boundaries
-         * where no new notes appear to reset the envelope state. */
-        if (envSlide != 0 && cell->vol == 0) {
+        /* Stutter: alternating volume on/off from mSetVol(0)/mSetVol(N) loop.
+         * Only applied on stutter overflow channels (ch >= BASE+OVF).
+         * Includes linear fade-out over stutterFadeCycles. */
+        if (stutterOn > 0 && stutterOff > 0 && !inRelease && cell->vol == 0
+            && ch >= (BASE_CHANS + OVERFLOW_CHANS)) {
+          if (stutterDelayLeft > 0) {
+            stutterDelayLeft -= xmSpeed;
+          } else {
+            int cycle = stutterOff + stutterOn;
+            int onFrames = 0;
+            for (int f = 0; f < xmSpeed; f++) {
+              int pos = stutterPhase % cycle;
+              if (pos >= stutterOff) onFrames++;
+              stutterPhase++;
+            }
+            int sv = scaleVol(stutterVol);
+            /* mAddBegin shifts sample start each cycle on a looping sample →
+             * timbre changes slightly but volume stays essentially constant.
+             * Model as a very gentle, asymptotic fade (never reaches zero). */
+            if (stutterFadeCycles > 0 && stutterPhase > 0) {
+              int totalFadeFrames = stutterFadeCycles * cycle;
+              int elapsed = stutterPhase;
+              if (elapsed > totalFadeFrames) elapsed = totalFadeFrames;
+              /* Fade to ~75 % over the fade period, then hold there */
+              int minSv = (sv * 3 + 2) / 4;
+              sv = minSv + ((sv - minSv) * (totalFadeFrames - elapsed)) / totalFadeFrames;
+              if (sv < minSv) sv = minSv;
+            }
+            int avgVol = (sv * onFrames + xmSpeed / 2) / xmSpeed;
+            if (avgVol > 64) avgVol = 64;
+            if (avgVol < 0) avgVol = 0;
+            cell->vol = (unsigned char)(0x10 + avgVol);
+            runningVol = avgVol;
+          }
+        } else
+
+        /* Volume envelope slide: track running volume toward target.
+         * Handles both downward (envSlide < 0) and upward (envSlide > 0) slides.
+         * During sustain: stop at sustainTargetVol.
+         * During release stage 1: stop at releaseTargetVol, then switch to stage 2.
+         * During release stage 2 (or stage 1 with target 0): slide to 0.
+         * Overrides any pEnve volume left on this row — in real TFMX hardware
+         * the macro envelope and pattern envelope share the same registers. */
+        if (envSlide != 0) {
+          if (cell->vol != 0) cell->vol = 0;
+          int stopAt;
+          if (inRelease && !inRelease2 && releaseTargetVol > 0)
+            stopAt = releaseTargetVol;
+          else if (inRelease)
+            stopAt = 0;
+          else
+            stopAt = sustainTargetVol;
+
+          bool moving = (envSlide < 0) ? (runningVol > stopAt)
+                                       : (runningVol < stopAt);
+
           if (envDelayLeft > 0) {
             envDelayLeft--;
-          } else if (runningVol > 0) {
-            runningVol += envSlide;
-            if (runningVol <= 0) {
-              runningVol = 0;
-              envSlide = 0;
-              vibActive = false;
-              vibPending = false;
+          } else if (moving) {
+            int slideThisRow = envSlide * xmTicksPerRow;
+            runningVol += slideThisRow;
+            bool overshot = (envSlide < 0) ? (runningVol <= stopAt)
+                                           : (runningVol >= stopAt);
+            if (overshot) {
+              if (stopAt > 0) {
+                cell->vol = (unsigned char)(0x10 + stopAt);
+                runningVol = stopAt;
+                if (inRelease && !inRelease2 && releaseSlide2 != 0) {
+                  envSlide = releaseSlide2;
+                  inRelease2 = true;
+                } else {
+                  envSlide = 0;
+                }
+              } else {
+                cell->vol = 0x10;
+                runningVol = 0;
+                envSlide = 0;
+                vibActive = false;
+                vibPending = false;
+              }
             } else {
               if (envSlide < 0)
                 cell->vol = (unsigned char)(0x60 + (-envSlide));
               else if (envSlide > 0)
                 cell->vol = (unsigned char)(0x70 + envSlide);
             }
+          } else if (runningVol == stopAt && stopAt > 0) {
+            if (inRelease && !inRelease2 && releaseSlide2 != 0) {
+              envSlide = releaseSlide2;
+              inRelease2 = true;
+            } else {
+              envSlide = 0;
+            }
           } else {
-            envSlide = 0;
+            /* Starting volume already at or below sustain target (can happen
+             * with low patVol where scaleVol rounds below the target).  If a
+             * release envelope exists, start it immediately — the sustain
+             * phase is effectively complete and waiting for a pKeyUp that may
+             * never arrive would leave the note hanging at audible volume. */
+            if (envSlide < 0 && runningVol > 0 && runningVol < stopAt
+                && stopAt > 0 && !inRelease) {
+              if (releaseSlide != 0) {
+                int rs = releaseSlide;
+                if (rs < -15) rs = -15;
+                else if (rs > 15) rs = 15;
+                envSlide = rs;
+              } else {
+                int s = (runningVol + xmTicksPerRow * 2 - 1) / (xmTicksPerRow * 2);
+                if (s < 2) s = 2;
+                if (s > 15) s = 15;
+                envSlide = -s;
+              }
+              inRelease = true;
+            } else {
+              envSlide = 0;
+            }
           }
         }
+
+        /* Track pEnve volume changes in runningVol and block volume increases
+         * on channels that have faded to silence.  In real TFMX, the pattern
+         * envelope modifies CurVol directly; our Phase 2 must stay in sync
+         * so the release/cleanup logic uses the correct baseline volume. */
+        if (envSlide == 0 && cell->vol != 0) {
+          unsigned char v = cell->vol;
+          if (v >= 0x60 && v <= 0x6F) {
+            runningVol -= (v & 0x0F) * xmTicksPerRow;
+            if (runningVol < 0) runningVol = 0;
+          } else if ((v >= 0x70 && v <= 0x7F) || (v > 0x10 && v <= 0x50)) {
+            if (runningVol <= 0) {
+              cell->vol = 0x10;
+            } else if (v >= 0x70) {
+              runningVol += (v & 0x0F) * xmTicksPerRow;
+              if (runningVol > 64) runningVol = 64;
+            } else {
+              runningVol = v - 0x10;
+            }
+          }
+        }
+
       }
     }
   }
@@ -1315,21 +1653,41 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
    * PHASE 3: Write the XM file.
    * =================================================================== */
 
+  /* Trim unused trailing channels (overflow/stutter channels that are
+   * completely empty).  Scan backwards from the last channel.
+   * gridStride stays at the original allocation width so bigGrid indexing
+   * remains valid; only xmChans (channels written to the file) is reduced. */
+  int gridStride = numChans;
+  int xmChans = numChans;
+  {
+    int usedChans = BASE_CHANS;
+    for (int ch = numChans - 1; ch >= BASE_CHANS; ch--) {
+      bool hasData = false;
+      for (int row = 0; row < totalXmRows && !hasData; row++) {
+        XMCell* c = &bigGrid[row * gridStride + ch];
+        if (c->note || c->inst || c->vol || c->fx || c->param)
+          hasData = true;
+      }
+      if (hasData) { usedChans = ch + 1; break; }
+    }
+    xmChans = usedChans;
+  }
+
   /* Slice total rows into 64-row XM patterns */
   int numPatterns = (totalXmRows + ROWS_PER_PAT - 1) / ROWS_PER_PAT;
   if (numPatterns < 1) numPatterns = 1;
   if (numPatterns > 256) numPatterns = 256;
   int songLen = numPatterns;
 
-  printf("XM-Export: %d total rows -> %d patterns (%d rows/pat), speed=%d BPM=125\n",
-         totalXmRows, numPatterns, ROWS_PER_PAT, xmSpeed);
+  printf("XM-Export: %d total rows -> %d patterns (%d rows/pat), %d channels, speed=%d BPM=125\n",
+         totalXmRows, numPatterns, ROWS_PER_PAT, xmChans, xmSpeed);
 
   /* XM header fields (at offset 60, inside the 276-byte header block) */
   writeU16(out, (unsigned short)songLen);  /* song length in patterns */
   int restartPos = (loopJumpTargetXmRow >= 0)
                    ? loopJumpTargetXmRow / ROWS_PER_PAT : 0;
   writeU16(out, (unsigned short)restartPos); /* restart position */
-  writeU16(out, (unsigned short)numChans);  /* number of channels */
+  writeU16(out, (unsigned short)xmChans);  /* number of channels */
   writeU16(out, (unsigned short)numPatterns);
   writeU16(out, 128);                      /* number of instruments */
   writeU16(out, 1);                        /* flags: 1 = linear frequency table */
@@ -1352,12 +1710,12 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
     int patRows = patEnd - patStart;
     if (patRows < 1) patRows = 1;
 
-    unsigned char* packed = (unsigned char*)malloc((size_t)(patRows * numChans * 6));
+    unsigned char* packed = (unsigned char*)malloc((size_t)(patRows * xmChans * 6));
     if (!packed) { free(bigGrid); fclose(out); free(mdatBuf); free(smpl); return false; }
     unsigned char* p = packed;
     for (int row = patStart; row < patStart + patRows; row++) {
-      for (int ch = 0; ch < numChans; ch++) {
-        XMCell* c = &bigGrid[row * numChans + ch];
+      for (int ch = 0; ch < xmChans; ch++) {
+        XMCell* c = &bigGrid[row * gridStride + ch];
         if (c->note == 0 && c->inst == 0 && c->vol == 0 && c->fx == 0 && c->param == 0) {
           *p++ = 0x80;
         } else {
@@ -1419,6 +1777,7 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
         si.start = 0; si.len = 512; si.oneShot = true;
       }
       if (si.len < 4) si.len = 4;
+
       smpStart = si.start;
       smpLen   = si.len;
       relNote  = (signed char)si.addNote;
@@ -1438,6 +1797,58 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
         xmLoopLen = (unsigned int)smpLen;
       }
       snprintf(labelBuf, 22, "Instrument %03d", inst + 1);
+    }
+
+    /* mAddBegin sweep: the Amiga DMA loops the sample while shifting the loop
+     * start by sweepAmt bytes every frame.  XM has no such effect, so we bake
+     * the sweep into a longer one-shot sample by concatenating overlapping
+     * loop iterations, each starting from a progressively shifted offset.
+     * Note: baking uses smpLen (sustain only, before attack prepend). */
+    signed char* bakedBuf = NULL;
+    int bakedLen = 0;
+    if (atkSrcMacro < 0) {
+      MacroSampleInfo& si2 = macroSI[inst];
+      if (si2.sweepAmt > 0 && si2.sweepFrames > 0 && smpLen >= 4) {
+        int origLen = smpLen;
+        int totalSweep = si2.sweepAmt * si2.sweepFrames;
+        int srcLen = origLen + totalSweep;
+        if (smpStart + srcLen > (int)smplLen)
+          srcLen = (int)smplLen - smpStart;
+        if (srcLen > origLen) {
+          const signed char* src = smpl + smpStart;
+          /* Amiga DMA loops the sample many times per frame for short
+           * waveforms.  Estimate loops-per-frame using ~256 bytes/frame
+           * (mid-range Amiga period at 50 Hz). */
+          int loopsPerFrame = 256 / origLen;
+          if (loopsPerFrame < 1) loopsPerFrame = 1;
+          int nFrames = si2.sweepFrames;
+          if (nFrames < 1) nFrames = 1;
+          int nLoops = nFrames * loopsPerFrame;
+          if (nLoops < 2) nLoops = 2;
+          if (nLoops > 512) nLoops = 512;
+          bakedLen = nLoops * origLen;
+          bakedBuf = (signed char*)malloc((size_t)bakedLen);
+          if (bakedBuf) {
+            int writePos = 0;
+            for (int frame = 0; frame < nFrames; frame++) {
+              int offset = frame * si2.sweepAmt;
+              for (int lp = 0; lp < loopsPerFrame; lp++) {
+                for (int b = 0; b < origLen; b++) {
+                  int readPos = offset + b;
+                  if (readPos < srcLen)
+                    bakedBuf[writePos++] = src[readPos];
+                  else
+                    bakedBuf[writePos++] = 0;
+                }
+              }
+            }
+            smpLen = bakedLen;
+            loopType = 0;
+            xmLoopStart = 0;
+            xmLoopLen = 0;
+          }
+        }
+      }
     }
 
     writeU32(out, 263);  /* instrument header size (including sample header) */
@@ -1476,14 +1887,24 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
     snprintf(instName, 22, "%s", labelBuf);
     fwrite(instName, 1, 22, out);
 
-    /* Write delta-encoded sample data immediately after sample header */
-    unsigned char* delta = (unsigned char*)malloc((size_t)smpLen);
-    if (delta) {
-      deltaEncode8(smpl + smpStart, smpLen, delta);
-      fwrite(delta, 1, (size_t)smpLen, out);
-      free(delta);
+    /* Write delta-encoded sample data */
+    if (bakedBuf) {
+      unsigned char* delta = (unsigned char*)malloc((size_t)bakedLen);
+      if (delta) {
+        deltaEncode8(bakedBuf, bakedLen, delta);
+        fwrite(delta, 1, (size_t)bakedLen, out);
+        free(delta);
+      }
+      free(bakedBuf);
+    } else {
+      unsigned char* delta = (unsigned char*)malloc((size_t)smpLen);
+      if (delta) {
+        deltaEncode8(smpl + smpStart, smpLen, delta);
+        fwrite(delta, 1, (size_t)smpLen, out);
+        free(delta);
+      }
     }
-  }
+  }  /* end of instrument write */
 
   fclose(out);
   free(mdatBuf);
