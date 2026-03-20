@@ -229,12 +229,13 @@ static MacroSampleInfo getMacroSample(const TFMXMacroData macro[256]) {
         break;
       }
       case mAddBegin:
-        if (afterOn && !gotAddBegin && !afterWaitUp) {
+        if (afterOn && !gotAddBegin) {
           int amt = (signed short)((macro[i].data[1]<<8)|macro[i].data[2]);
           if (amt > 0) {
             info.sweepAmt = amt;
             int frames = 0;
             bool hitInfiniteLoop = false;
+            int effectiveHp = macro[i].data[0];
             for (int j = i + 1; j < 256; j++) {
               if (macro[j].op == mWait) {
                 int w = (macro[j].data[0]<<16)|(macro[j].data[1]<<8)|macro[j].data[2];
@@ -272,11 +273,13 @@ static MacroSampleInfo getMacroSample(const TFMXMacroData macro[256]) {
                   hitInfiniteLoop = true;
                   break;
                 }
-              } else if (macro[j].op == mAddBegin && info.sweepAmt2 == 0) {
+              } else if (macro[j].op == mAddBegin) {
                 int amt2 = (signed short)((macro[j].data[1]<<8)|macro[j].data[2]);
-                if (amt2 != 0 && amt2 != amt) {
+                if (info.sweepAmt2 == 0 && amt2 != 0 && amt2 != amt) {
                   info.sweepAmt2 = amt2;
                   info.sweepReverseFrame = frames;
+                } else if (amt2 == amt) {
+                  effectiveHp = macro[j].data[0];
                 }
               } else if (macro[j].op == mOneShot || macro[j].op == mStop) {
                 break;
@@ -289,7 +292,7 @@ static MacroSampleInfo getMacroSample(const TFMXMacroData macro[256]) {
             } else {
               if (frames <= 0) frames = 40;
               info.sweepFrames = frames;
-              info.sweepHalfPeriod = macro[i].data[0];
+              info.sweepHalfPeriod = effectiveHp;
             }
           }
           gotAddBegin = true;
@@ -953,6 +956,30 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
         continue;
       }
       if (macro[i][j].op == mOn || macro[i][j].op == mStop) break;
+    }
+    /* Second pass: detect mCont AFTER mOn for wavetable-sweep macros.
+     * Some macros play a tiny single-cycle waveform (<=128 bytes) with
+     * mAddBegin sweep as an attack, then mCont to a different macro with
+     * the actual sustain sample (e.g., sampled string).  The target macro
+     * provides the sustained sound that the listener perceives.
+     * Only applies when no pre-mOn mCont was found and the source sample
+     * is small (indicating wavetable synthesis, not a real sample). */
+    if (macroContTarget[i] < 0 && sKeySplit[i] < 0) {
+      bool pastOn = false;
+      int srcLen = 0;
+      for (int j = 0; j < 256; j++) {
+        if (macro[i][j].op == mSetLen && !pastOn)
+          srcLen = ((macro[i][j].data[1] << 8) | macro[i][j].data[2]) * 2;
+        if (macro[i][j].op == mOn) pastOn = true;
+        if (pastOn && macro[i][j].op == mCont) {
+          int target = macro[i][j].data[0];
+          if (target >= 0 && target < 128 && target != i &&
+              srcLen > 0 && srcLen <= 128)
+            macroContTarget[i] = target;
+          break;
+        }
+        if (macro[i][j].op == mStop) break;
+      }
     }
   }
 
@@ -2171,7 +2198,7 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
     unsigned char loopType = 0;
     unsigned int xmLoopStart = 0, xmLoopLen = 0;
     signed char relNote = 0;
-    char labelBuf[22];
+    char labelBuf[64];
 
     if (atkSrcMacro >= 0) {
       /* Attack instrument: one-shot, no loop, relativeNote = 0 */
@@ -2181,7 +2208,7 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
       if (smpLen < 4) smpLen = 4;
       loopType = 0;
       relNote  = 0;
-      snprintf(labelBuf, 22, "Atk M%03d", atkSrcMacro);
+      snprintf(labelBuf, sizeof(labelBuf), "Attack M%03d", atkSrcMacro);
     } else {
       MacroSampleInfo si = macroSI[inst];
       if (si.start + si.len > (int)smplLen) {
@@ -2208,9 +2235,9 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
         xmLoopLen = (unsigned int)smpLen;
       }
       if (inst == 0)
-        snprintf(labelBuf, 22, "domy@noisebay.org");
+        snprintf(labelBuf, sizeof(labelBuf), "domy@noisebay.org");
       else
-        snprintf(labelBuf, 22, "Instrument %03d", inst + 1);
+        snprintf(labelBuf, sizeof(labelBuf), "Instrument %03d", inst + 1);
     }
 
     /* mAddBegin sweep: the Amiga DMA loops the sample while shifting the loop
@@ -2328,54 +2355,11 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
       }
     }
 
-    /* 4x upsample very short looping waveforms to approximate the Amiga's
-     * analog reconstruction filter.  Paula's DAC outputs a staircase signal
-     * smoothed by an RC low-pass (~3.3-4.5 kHz).  XM trackers render samples
-     * through software mixing without that filter, so short single-cycle
-     * waves (<=256 bytes) sound harsh at higher pitches — especially noticeable
-     * with complex bass waveforms.  Cubic Hermite 4x interpolation creates a
-     * smoother version; relativeNote is bumped +24 (2 octaves) to keep the
-     * fundamental pitch identical. */
-    if (!bakedBuf && atkSrcMacro < 0 && loopType == 1 &&
-        xmLoopStart == 0 && xmLoopLen == (unsigned int)smpLen &&
-        smpLen >= 4 && smpLen <= 256 &&
-        (int)relNote + 24 <= 127) {
-      const int UPS = 4;
-      int newLen = smpLen * UPS;
-      signed char* upBuf = (signed char*)malloc((size_t)newLen);
-      if (upBuf) {
-        const signed char* src = smpl + smpStart;
-        int n = smpLen;
-        for (int i = 0; i < newLen; i++) {
-          double pos = (double)i / UPS;
-          int idx0 = (int)pos;
-          double frac = pos - idx0;
-          int p0 = src[((idx0 - 1) % n + n) % n];
-          int p1 = src[idx0 % n];
-          int p2 = src[(idx0 + 1) % n];
-          int p3 = src[(idx0 + 2) % n];
-          double a = -0.5*p0 + 1.5*p1 - 1.5*p2 + 0.5*p3;
-          double b = p0 - 2.5*p1 + 2.0*p2 - 0.5*p3;
-          double c = -0.5*p0 + 0.5*p2;
-          double d = p1;
-          double val = a*frac*frac*frac + b*frac*frac + c*frac + d;
-          if (val < -128) val = -128;
-          if (val > 127) val = 127;
-          upBuf[i] = (signed char)(int)round(val);
-        }
-        bakedBuf = upBuf;
-        bakedLen = newLen;
-        smpLen = newLen;
-        xmLoopLen = (unsigned int)newLen;
-        relNote = (signed char)((int)relNote + 24);
-      }
-    }
-
     writeU32(out, 263);  /* instrument header size (including sample header) */
 
     char instName[22];
     memset(instName, 0, 22);
-    snprintf(instName, 22, "%s", labelBuf);
+    { size_t n = strlen(labelBuf); if (n > 22) n = 22; memcpy(instName, labelBuf, n); }
     fwrite(instName, 1, 22, out);
     fputc(0, out);          /* instrument type (always 0) */
     writeU16(out, 1);       /* number of samples in this instrument */
@@ -2404,7 +2388,7 @@ bool convertToXM(const char* mdatPath, const char* smplPath, const char* outPath
     fputc((unsigned char)relNote, out);       /* relative note */
     fputc(0, out);                            /* reserved / encoding (0 = delta) */
     memset(instName, 0, 22);
-    snprintf(instName, 22, "%s", labelBuf);
+    { size_t n = strlen(labelBuf); if (n > 22) n = 22; memcpy(instName, labelBuf, n); }
     fwrite(instName, 1, 22, out);
 
     /* Write delta-encoded sample data */
